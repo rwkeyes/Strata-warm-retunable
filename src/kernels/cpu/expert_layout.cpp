@@ -53,8 +53,43 @@ bool cpu_avx512_ok() {
     return ok;
 }
 
+bool cpu_avx1_ok() {
+    // This fork's AVX1 floor: AVX (bit 28) + OSXSAVE (bit 27) with the OS having enabled XMM/YMM state.
+    // FMA and F16C are deliberately NOT required - that is cpu_avx2_ok()'s bar.  On such a CPU the expert
+    // kernels fall through to ggml-cpu's vec_dot, which the build compiles per ISA down to this variant.
+    static const bool ok = [] {
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(1, 0);
+        const unsigned ecx1 = r[2];
+        if (!((ecx1 >> 27) & 1u) || !((ecx1 >> 28) & 1u)) return false;   // OSXSAVE, AVX
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
+        unsigned lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+        return (xcr0 & 0x6) == 0x6;                                        // XMM and YMM state enabled
+    }();
+    return ok;
+}
+
+
 bool cpu_avx2_ok() {
     static const bool ok = [] {
+        // This fork: STRATA_FORCE_AVX1=1 answers "no AVX2" so the AVX1 tier can be exercised on any CPU
+        // (the mirror of STRATA_FORCE_AVX2, which drops the AVX-512 tier).  Combined with STRATA_FORCE_AVX2=1
+        // it simulates an AVX-only CPU on modern hardware.
+        if (const char* f = std::getenv("STRATA_FORCE_AVX1"); f != nullptr && f[0] == '1') return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
 #if defined(_MSC_VER)

@@ -1550,9 +1550,16 @@ int main(int argc, char** argv) {
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu in the release build, which the native pack's layout load initializes
     // next.  Refused here, by name, rather than an illegal instruction in the first expert.
-    if (!strata::kernels::cpu::cpu_avx2_ok()) {
-        std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which every CPU "
-                             "expert kernel needs; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer\n",
+    //
+    // THIS FORK relaxes that to the AVX1 floor for NATIVE packs: with the ggml-cpu fallback tier compiled for
+    // every ISA (GGML_CPU_ALL_VARIANTS), an AVX-only CPU (Sandy Bridge) runs the expert rows through ggml-cpu's
+    // vec_dot instead of the multi-token AVX2/AVX-512 kernels.  The canonical Q2_0 pack is unaffected: its
+    // sub-AVX-512 kernels really are AVX2-only (expert_layout.cpp q2_rows_any) and cpu_require_expert_support()
+    // still demands AVX-512 for it.
+    if (!strata::kernels::cpu::cpu_avx2_ok() && !strata::kernels::cpu::cpu_avx1_ok()) {
+        std::fprintf(stderr, "strata generate: this CPU (%s) supports neither AVX2 with FMA/F16C nor AVX1, and the "
+                             "CPU expert kernels need at least one of them (this build's fallback tier is ggml-cpu's "
+                             "vec_dot, compiled per ISA)\n",
                      strata::kernels::cpu::cpu_name().c_str());
         return 2;
     }
