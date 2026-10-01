@@ -1636,7 +1636,9 @@ int main(int argc, char** argv) {
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
-                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+                     !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (AVX1 floor)"
+                                                          : (std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2"
+                                                                                                       : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)"));
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,

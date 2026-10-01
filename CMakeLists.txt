@@ -775,6 +775,38 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
+  # ---- THIS FORK: an ISA-floor build (AVX1 and up, one binary) ----
+  # GGML_NATIVE=ON compiles ggml-cpu for the *build host*, so the engine carries that host's ISA and dies on
+  # an older CPU with an illegal instruction.  STRATA_PORTABLE selects a fixed AVX2 baseline instead, which is
+  # still above an AVX-only machine (Sandy Bridge).  With STRATA_ISA_FLOOR=ON, ggml-cpu is built as one library
+  # per ISA - AVX1 (sandybridge) up to AVX-512 - and ggml picks the right one at run time, which is what the
+  # engine's fallback tier needs on an AVX-only CPU.  Per-ISA CPU libraries require backend DL, which is why
+  # GGML_BACKEND_DL has to be forced back on here (line 767 forces it off): the plugins land in
+  # <build>/bin/libggml-cpu-*.so and are found next to the binary or through GGML_BACKEND_PATH.
+  # AVX2/AVX-512 hosts are unaffected: they get the same code they had, chosen by the same dispatch.
+  if(STRATA_ISA_FLOOR)
+    # A single ggml-cpu compiled for the AVX1 floor: the same idea as STRATA_PORTABLE (a fixed ISA baseline
+    # instead of the build host's), one notch lower.  The feature set is ggml's own "sandybridge" variant
+    # (ggml/src/CMakeLists.txt:496: SSE42 + AVX) - which is what an AVX-only Xeon has.  Checked against the
+    # hardware: a Xeon E5-2665 reports neither F16C nor FMA, so enabling F16C here (as the ivybridge variant
+    # and up do) would emit vcvtph2ps and fault.
+    #
+    # NOT the multi-variant route: ggml's per-ISA CPU libraries are dynamic backends, and GGML_BACKEND_DL
+    # requires BUILD_SHARED_LIBS (ggml/src/CMakeLists.txt:188-189), which this project cannot use - it links
+    # -static, and ld refuses to build a shared object from static crt objects (crtbeginT.o: relocation
+    # R_X86_64_32 against hidden symbol __TMC_END__).  Each host builds its own engine, so AVX2/AVX-512
+    # machines keep their native code and only AVX-only boxes take this build.
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    foreach(_f GGML_SSE42 GGML_AVX)
+      set(${_f} ON CACHE BOOL "" FORCE)
+    endforeach()
+    foreach(_f GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2 GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI GGML_AVXVNNI)
+      set(${_f} OFF CACHE BOOL "" FORCE)
+    endforeach()
+  endif()
   if(STRATA_GGML_DIR)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
