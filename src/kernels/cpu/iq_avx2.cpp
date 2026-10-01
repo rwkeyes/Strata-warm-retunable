@@ -59,7 +59,7 @@ inline __m256i sc32(int s) { return _mm256_set1_epi16(s); }
 // Built once at load time from the shared ggml-common table so it can never drift from it.
 struct EvenSigns {
     uint64_t v[128];
-    EvenSigns() {
+    constexpr EvenSigns() : v{} {
         for (int i = 0; i < 128; ++i) {
             uint64_t r = 0;
             for (int k = 0; k < 8; ++k)
@@ -68,7 +68,13 @@ struct EvenSigns {
         }
     }
 };
-static const EvenSigns even_signs;
+// constexpr, NOT a runtime constructor.  This TU is compiled with -mavx2 (the file's functions need it), and
+// a runtime constructor here got vectorised into AVX-2 (vpbroadcastb) and emitted into
+// _GLOBAL__sub_I_iq_avx2.cpp - code that runs at dlopen/startup, BEFORE main and before any CPU feature
+// check can run.  On an AVX-only CPU (Xeon E5 v1/v2) that is an immediate SIGILL, and no runtime probe can
+// prevent it.  Computing the table at compile time removes the initialiser entirely, so the only AVX-2 left
+// in this TU is inside the kernels, which are called behind cpu_avx2_ok().
+static constexpr EvenSigns even_signs{};
 
 inline float hsum8(__m256 v) {
     const __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
