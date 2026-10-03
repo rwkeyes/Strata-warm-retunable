@@ -50,6 +50,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -103,7 +104,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 37)                # v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+MIN_ENGINE = (0, 1, 38)                # v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (#214)
 
@@ -2469,8 +2470,25 @@ def find_in(roots: list, rel: str):
 
 
 # ------------------------------------------------------------------------------------------------ start
+def model_config(path: Path) -> bool:
+    """#549: a model's run config (a JSON object with "exe" and "args"). Any other strata-*.json in the folder (a
+    file of the user's own, a cut-off one) is skipped with a warning naming it instead of stopping setup."""
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(cfg, dict) and cfg.get("exe") and isinstance(cfg.get("args"), list):
+            return True
+        why = 'no "exe" or "args"'
+    except OSError as e:
+        why = e.strerror or str(e)
+    except ValueError:
+        why = "not valid JSON"
+    warn(f"skipped {path.name} ({why}): it is not a Strata model config")
+    return False
+
+
 def installed_configs():
-    return sorted(ROOT.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p for p in sorted(ROOT.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if model_config(p)]
 
 
 def source_version() -> str:
@@ -2585,6 +2603,7 @@ def update_install(have: list, a) -> int:
     setup needs a newer one (MIN_ENGINE; a compiled engine when its source changed), each installed model's config
     upgrades and its draft subset.  No question is asked and the model files are not touched; a model still running
     keeps its engine (update_installed_engine says to close it and run this again)."""
+    have = [p for p in have if model_config(p)]        # #549: a strata-*.json that is no model config is skipped
     if not have:
         say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
         say("  it finds an earlier install's model files next to it and reuses them.")
@@ -2605,6 +2624,29 @@ def update_install(have: list, a) -> int:
     ok("Strata is updated" + (f" (engine {'.'.join(map(str, ver))})" if any(ver) else "") +
        ". Start the model with " + ("START-HERE.bat" if WIN else "./setup.sh") + " when you want it.")
     return 0
+
+
+def settings_summary(cfg: dict, port=None) -> str:
+    """#564: the settings a start uses, in one line: the config's engine options (the model's file paths left out)
+    and the server's own fields, so a change made by hand to strata-<model>.json can be checked without the log."""
+    a, out, i = [str(x) for x in cfg.get("args") or []], [], 0
+    while i < len(a):
+        flag = a[i]
+        val = a[i + 1] if i + 1 < len(a) and not a[i + 1].startswith("--") else None
+        i += 1 if val is None else 2
+        if not flag.startswith("--"):
+            continue                                   # a positional: the model file
+        if val is not None and ("/" in val or "\\" in val or val.lower().endswith((".gguf", ".bin"))):
+            continue                                   # a path: --native, --mtp, --profile ...
+        out.append(flag if val is None else f"{flag} {val}")
+    srv = [f"{cfg.get('host', '127.0.0.1')}:{port or cfg.get('port', 8080)}"]
+    if cfg.get("api_key"):
+        srv.append("api key set")
+    for k in ("gpu", "layer_split", "draft_vocab", "fit_max_tokens", "reasoning_budget_tokens", "anthropic_thinking"):
+        if cfg.get(k) is not None:
+            v = cfg[k]
+            srv.append(f"{k} {','.join(map(str, v)) if isinstance(v, list) else str(v).lower() if isinstance(v, bool) else v}")
+    return " ".join(out) + ("; " if out else "") + "server " + ", ".join(srv)
 
 
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
@@ -2720,6 +2762,9 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     say("  restart). That is normal: please wait and don't close this window - the browser opens when it is ready.")
     say("  Later, closing this window stops the model.")
     say("  " + "-" * 100)
+    for n, line in enumerate(textwrap.wrap(f"Settings ({cfg_path.name}): {settings_summary(cfg, port)}", 100,
+                                           break_on_hyphens=False)):   # #564: what this start uses
+        say(("  " if n == 0 else "    ") + line)
     if not WIN and os.environ.get("STRATA_EXECV"):
         # Replace this process instead of spawning a child. The Docker image sets STRATA_EXECV=1,
         # so there the server is PID 1 and docker stop's SIGTERM reaches the process that can
@@ -2762,6 +2807,47 @@ def draft_vocab_note(vram_gb: float, chosen: str | None) -> list[str]:
             f"  For English and code answers, {start} --draft-vocab en needs up to ~{DRAFT_VOCAB_MIB['en']} MiB "
             f"(cyrillic: ~{DRAFT_VOCAB_MIB['cyrillic']}) and leaves the rest to the expert cache - and it is the",
             "  fix when the start stops with \"the draft head does not fit\". The model keeps the choice."]
+
+
+SMALL_CARD_GB = 7.5            # #496: a card under 8 GB gets a tip (an 8 GB card lists 7.99)
+
+
+def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
+    """#496: what frees VRAM on a card under 8 GB when the start stops with "no VRAM is left for the expert cache"
+    (the engine already lowers its own reserve on such a card) - a recommendation, setup changes none of it.  (The
+    draft layer stays: the server needs it.)"""
+    start = "START-HERE.bat --setup" if WIN else "./setup.sh"
+    tips = []
+    if ctx > 8192:
+        tips.append("an 8K context (a smaller KV cache)")
+    if draft_vocab != "en":
+        tips.append(f"--draft-vocab en (a draft head of ~{DRAFT_VOCAB_MIB['en']} MiB instead of "
+                    f"~{DRAFT_VOCAB_MIB[draft_vocab or 'cjk']})")
+    lines = ["If the start stops with \"no VRAM is left for the expert cache\" (the engine's log says how much is "
+             "short):"]
+    if tips:
+        lines.append(f"  run {start} again with " + " and ".join(tips) + ", or close other programs that use the GPU.")
+    else:
+        lines.append("  close other programs that use the GPU.")
+    return lines
+
+
+DESKTOP_RESERVE_MIB = 3072     # #560 #516: what kept a KDE/Wayland desktop alive beside a full expert cache
+
+
+def linux_desktop(env=None) -> bool:
+    """A graphical session on Linux (Wayland or X)."""
+    env = os.environ if env is None else env
+    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+
+
+def desktop_reserve_note() -> list[str]:
+    """#560 #516: an AMD card that also drives a Linux desktop - with the default 700 MiB reserve the expert cache
+    fills it, and when the desktop needs more VRAM amdgpu moves the cache to system RAM, where the OOM killer then ends
+    the compositor.  A recommendation, setup changes nothing."""
+    return [f"If this AMD card also drives your desktop and the desktop or apps crash once the model is loaded, keep "
+            f"more VRAM free: ./setup.sh --vram-reserve-mib {DESKTOP_RESERVE_MIB}",
+            "  (remembered for this model; the expert cache gets ~2.3 GB less, a few % of speed)"]
 
 
 def mtp_corrupt(mtp: Path, env=None) -> bool:
@@ -3568,6 +3654,14 @@ def main() -> int:
             args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
+    if not multi and 0 < gpu.get("vram_gb", 0.0) < SMALL_CARD_GB:
+        # #496: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when that
+        # is what it takes, and says what is short when even that is not enough.  Setup only says what helps.
+        for line in small_card_note(ctx, draft_vocab):   # a recommendation: nothing changes
+            say("  " + line)
+    elif hip and a.vram_reserve_mib is None and linux_desktop():
+        for line in desktop_reserve_note():              # #560 #516: a recommendation: nothing changes
+            say("  " + line)
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",

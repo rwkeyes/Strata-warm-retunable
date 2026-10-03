@@ -330,5 +330,61 @@ class VramReserve(unittest.TestCase):
         self.assertTrue(call.called)
 
 
+class SmallCardTip(unittest.TestCase):
+    """#496: a card under 8 GB (a 6 GB laptop RTX 3060) gets a tip for when the start has no room for the expert cache;
+    the engine chooses its own reserve there, so the config is the one any card gets.  An 8 GB card: no tip."""
+
+    def install(self, vram, *extra):
+        from test_setup_golden import card, install
+        return install(63.7, [card(0, "NVIDIA GeForce RTX 3060 Laptop GPU", vram, "86")],
+                       ["--family", "qwen", "--model", "Q2_0", "--no-start", *extra])
+
+    def test_a_6gb_card(self):
+        code, out, cfg, _ = self.install(6.0)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--vram-reserve-mib", cfg["args"])          # the engine decides (no fixed reserve)
+        self.assertIn("no VRAM is left for the expert cache", out)
+        self.assertIn("--draft-vocab en", out)
+        self.assertIn("--mtp", cfg["args"])                          # the draft layer stays: the server needs it
+
+    def test_an_8gb_card_has_no_tip(self):
+        for vram in (8188 / 1024, 8.0):                               # nvidia-smi lists an 8 GB card as 8188 MiB
+            code, out, cfg, _ = self.install(vram)
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("no VRAM is left for the expert cache", out)
+            self.assertNotIn("--vram-reserve-mib", cfg["args"])
+
+    def test_a_given_reserve_is_kept(self):
+        code, out, cfg, _ = self.install(6.0, "--vram-reserve-mib", "500")
+        self.assertEqual(code, 0, out)
+        a = cfg["args"]
+        self.assertEqual(a[a.index("--vram-reserve-mib") + 1], "500")
+
+    def test_the_tip(self):
+        self.assertIn("an 8K context", " ".join(setup.small_card_note(32768, None)))
+        self.assertIn("--draft-vocab en", " ".join(setup.small_card_note(32768, "cjk")))
+        tip = " ".join(setup.small_card_note(8192, "en"))
+        self.assertNotIn("--draft-vocab", tip)
+        self.assertIn("close other programs", tip)
+
+
+class DesktopReserveTip(unittest.TestCase):
+    """#560 #516: an AMD card on a Linux desktop gets a recommended reserve (3072 MiB) - a tip, the config is not
+    changed."""
+
+    def test_desktop_detection(self):
+        with mock.patch.object(setup.sys, "platform", "linux"):
+            self.assertTrue(setup.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}))
+            self.assertTrue(setup.linux_desktop({"DISPLAY": ":0"}))
+            self.assertFalse(setup.linux_desktop({}))                 # a headless box / ssh
+        with mock.patch.object(setup.sys, "platform", "win32"):
+            self.assertFalse(setup.linux_desktop({"DISPLAY": ":0"}))  # Windows counts the desktop itself (#497)
+
+    def test_the_tip(self):
+        tip = " ".join(setup.desktop_reserve_note())
+        self.assertIn("--vram-reserve-mib 3072", tip)
+        self.assertIn("desktop", tip)
+
+
 if __name__ == "__main__":
     unittest.main()

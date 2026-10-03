@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -135,6 +137,8 @@ class MaxTokens(unittest.TestCase):
                 s, b, _, _ = self.call(api, max_tokens=CTX)
                 self.assertEqual(s, 400)
                 self.assertIn("exceeds the context", b["error"]["message"])
+                self.assertIn("\"fit_max_tokens\": true", b["error"]["message"])     # #545: says how to get past it
+                self.assertRegex(b["error"]["message"], r"at most \d+ here")
 
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
@@ -676,7 +680,7 @@ class ClientHangUp(unittest.TestCase):
         body = json.dumps({"model": "x", "max_tokens": 20, "stream": stream,
                            "messages": [{"role": "user", "content": "a long prompt"}]}).encode()
         c = so.create_connection(("127.0.0.1", self.port))
-        c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                   b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         time.sleep(1.0)
         c.close()
@@ -874,6 +878,31 @@ class DraftHeadHint(unittest.TestCase):
         self.assertEqual(start_failure_hint(p, off), "")
         self.assertEqual(start_failure_hint(None, 0), "")
         self.assertEqual(start_failure_hint(str(Path(tempfile.mkdtemp()) / "missing.log"), 0), "")
+
+
+class DesktopVramNote(unittest.TestCase):
+    """#560 #516: an AMD card on a Linux desktop with little VRAM left after the start gets a recommended reserve."""
+
+    def test_when_it_applies(self):
+        from serve.server import desktop_vram_note
+        note = desktop_vram_note("hip", 624, ["--kv", "int8"], True)
+        self.assertIn("624 MiB of VRAM free", note)
+        self.assertIn("--vram-reserve-mib 3072", note)
+        self.assertIn("2.3 GB less", note)
+
+    def test_when_it_does_not(self):
+        from serve.server import desktop_vram_note
+        self.assertEqual(desktop_vram_note(None, 624, [], True), "")               # NVIDIA
+        self.assertEqual(desktop_vram_note("hip", 624, [], False), "")             # no desktop session
+        self.assertEqual(desktop_vram_note("hip", 2994, [], True), "")             # room left
+        self.assertEqual(desktop_vram_note("hip", None, [], True), "")             # lazy start: no INFO yet
+        self.assertEqual(desktop_vram_note("hip", 900, ["--vram-reserve-mib", "4000"], True), "")   # already raised
+
+    def test_desktop_detection(self):
+        from serve import server
+        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "linux"):
+            self.assertTrue(server.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}))
+            self.assertFalse(server.linux_desktop({}))
 
 
 class StartFailureLog(unittest.TestCase):
@@ -1810,6 +1839,20 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["choices"][0]["finish_reason"], "length")
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20])
+
+    def test_a_reply_cut_while_thinking_is_named_in_the_log(self):
+        """#530: max tokens reached inside the thinking gives an empty answer; the server log says what helps."""
+        hint = "reached max tokens while still thinking"
+        for extra, said in (({"max_tokens": 10}, True), ({}, False)):
+            with self.subTest(extra=extra):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code, b = self.openai(**extra)
+                self.assertEqual(code, 200, b)
+                self.assertEqual(b["choices"][0]["finish_reason"], "length" if said else "stop")
+                self.assertEqual(hint in out.getvalue(), said, out.getvalue())
+                if said:
+                    self.assertIn("reasoning_budget_tokens", out.getvalue())
 
     def test_a_bad_value_is_a_400(self):
         for bad in ("lots", 2.5, True, [1]):
