@@ -1,3 +1,21 @@
+> # ⚠️ This branch is deprecated — use [Strata_Dirigo](https://github.com/rwkeyes/Strata_Dirigo)
+>
+> `Strata-warm-retunable` and this **`warm-retunable`** branch are superseded and **frozen**: they keep only the
+> 0.1.31-era work, and nothing here will receive the fixes or features below.
+>
+> The fork continues at **<https://github.com/rwkeyes/Strata_Dirigo>** (same repository, renamed), whose
+> **`main`** branch is based on **upstream v0.1.38** and adds, among others: Strata's own engine retuned at
+> runtime without a reload, the vendored `llama-server` retuned the same way, an API-key scope with an ALLOW list
+> (upstream's behaviour by default), an AVX1 floor that runs on AVX-only CPUs, `tool_choice` that actually gates a
+> turn, a request surface that names what it does not implement, and an empty-think guard for the chat template.
+> **Intel Arc support is coming very soon.**
+>
+> ```sh
+> git clone https://github.com/rwkeyes/Strata_Dirigo
+> ```
+>
+> Feature-by-feature detail: [`Strata_Dirigo`'s FORK-FEATURES.md](https://github.com/rwkeyes/Strata_Dirigo/blob/main/FORK-FEATURES.md).
+
 <h1 align="center">Strata</h1>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
