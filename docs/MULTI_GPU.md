@@ -8,7 +8,8 @@ speed comes from (decode then barely touches the CPU pool).
 
 This is pipeline (layer) parallelism, not tensor parallelism: a token crosses from one card to the next once per
 verify window (a few hundred KB through pinned RAM), not twice per layer. No NVLink or peer-to-peer access is
-needed; cards on x4 or x1 slots work, and the PCIe share of each card is probed on its own link.
+needed; cards on x4 or x1 slots work, and the PCIe share of each card is probed on its own link. A `--pcie-frac` you give
+is every card's share and skips those probes; there is no per-card setting yet.
 
 ## Using it
 
@@ -43,7 +44,8 @@ now on; the answer is kept.
 **Not supported** (setup says so and names the cards that can be used instead):
 - a card older than the RTX 20 series (compute capability below 7.5: GTX 10 and older);
 - a card with less than 8 GB of VRAM, together with others (each card holds a copy of the dense weights and its
-  own prompt buffers);
+  own prompt buffers) - unless you name it with `--gpus`: then setup says the risk and asks (`--yes` with the named
+  cards goes ahead);
 - Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `./setup.sh --backend
   hip --gpus 1,0`, see [AMD_HIP.md](AMD_HIP.md).)
 
