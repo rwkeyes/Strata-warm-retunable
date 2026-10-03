@@ -51,6 +51,33 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 ./serve/server.py --api-key "$SECRET" --api-key-scope lan --api-key-allow 10.1.0.0/16
 ```
 
+### Controlling the slots and the KV pool while it runs (item 2)
+
+With `--kv-unified` every slot shares **one** KV budget, and each slot's context is a *reservation* against it:
+`-np 4 -c 131072` is four 32,768-token shares — so three idle slots are holding 96k tokens of KV that a single
+long-context request could be using. The usual fix is to restart the server with different flags, which means
+reading the whole model back in (a minute or more) and dropping every open conversation. This patch makes the
+shape a knob instead:
+
+```sh
+llama-server -m model.gguf -ngl 99 -fa on --kv-unified --props -np 4 -c 131072 -a my-model
+curl -s localhost:8080/props | jq '{total_slots, slots_max, kv_pool_n_ctx, kv_unified}'  # the shape now
+
+curl -s -X POST localhost:8080/props -d '{"parallel": 4, "ctx_per_slot": 32768}'   # four short sessions
+curl -s -X POST localhost:8080/props -d '{"parallel": 1, "ctx_per_slot": 131072}'  # one long-context request
+curl -s -X POST localhost:8080/props -d '{"ctx": 262144}'                          # grow the pool itself
+curl -s -X POST localhost:8080/props -d '{"cache_type_k": "q8_0"}'                 # or the KV's own shape
+```
+
+**Why you would want to:** the demand oscillates — a coding agent fanning out four subagents wants four slots, and
+the 100k-token repository you paste a minute later wants one big one — and neither shape is "the right config".
+Moving between them costs **0–0.4 ms** for a re-slice and **~0.8 s** to rebuild the pool (a 32k → 262k pool,
+measured), because the weight buffers are never touched; a restart costs a full model reload. A request that would
+pull a **busy** slot out from under a live conversation is refused with
+`HTTP 400 slot N is busy, cannot take it out of service` — never a hang, never a silent drop. Measured costs, the
+VRAM-per-pool table, and the `parallel_max` / oversubscribe paths:
+[`warm-retune/SLOTS-AND-KV-POOL.md`](warm-retune/SLOTS-AND-KV-POOL.md).
+
 ### Hardware reach
 
 * **AMD**: HIP backend, measured on an **RX 7900 XTX 24 GB** (the reference box for the numbers in
@@ -80,6 +107,7 @@ when it lands.
 | file | what |
 |---|---|
 | [`FORK-FEATURES.md`](FORK-FEATURES.md) | every feature above, one page each: what it does, its limits, how far it is verified |
+| [`warm-retune/SLOTS-AND-KV-POOL.md`](warm-retune/SLOTS-AND-KV-POOL.md) | controlling slots and the KV pool on a running `llama-server`: the example, the why, the measured costs |
 | [`warm-retune/RETUNE-CANDIDATES.md`](warm-retune/RETUNE-CANDIDATES.md) | the audit: what can be retuned while running, and what cannot |
 | [`warm-retune/MINEFIELD-FINDINGS.md`](warm-retune/MINEFIELD-FINDINGS.md) | the serving-path traps found on this lane, the fixes, the retest |
 | [`warm-retune/NVME-VS-HDD.md`](warm-retune/NVME-VS-HDD.md) | the storage A/B measurements |

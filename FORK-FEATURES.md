@@ -45,6 +45,8 @@ is what enables the write path.
 `setup.py` applies the patch automatically once the vendored tree exists (`apply_warm_retune()`; never fatal);
 by hand it is `warm-retune/apply.sh apply|undo|check`.  Strata's own engine does **not** build `tools/server`,
 so the patch is inert until a `llama-server` is built from that tree.
+Worked example with the reasons, the measured costs and the VRAM-per-pool table:
+[`warm-retune/SLOTS-AND-KV-POOL.md`](warm-retune/SLOTS-AND-KV-POOL.md).
 
 ## 2 — Strata's own engine re-tunes without a restart
 
