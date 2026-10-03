@@ -1001,6 +1001,24 @@ def apply_warm_retune(llama: Path) -> None:
         warn(f"warm-retune/apply.sh could not run ({e}); apply it by hand for the retune endpoint")
 
 
+def isa_floor_defs() -> list:
+    """This fork's AVX1 floor, passed EXPLICITLY because CMake cannot default it: STRATA_ISA_FLOOR is
+    read by CMakeLists.txt (`if(STRATA_ISA_FLOOR)`) but is NOT declared as an `option()`, so on a fresh
+    build directory it is undefined - OFF - and the engine is compiled for the BUILD HOST instead
+    (GGML_NATIVE=ON).  That binary then dies with SIGILL on an AVX-only CPU, which is the machine this
+    fork exists for (and the failure is silent until the first expert row runs).  Opt-in on purpose: the
+    floor compiles ggml-cpu for SSE4.2+AVX, so a modern host trades a wider floor for a downgraded
+    ggml-cpu tier - unmeasured here, not zero.  Strata's own AVX2/AVX-512 kernel TUs are unaffected.
+
+        STRATA_ISA_FLOOR=1  ./setup.sh --backend hip ... --build    # portable: runs on an AVX-only Xeon
+        STRATA_ISA_FLOOR=0  ./setup.sh ... --build                  # host-native (default: upstream)
+    """
+    if os.environ.get("STRATA_ISA_FLOOR", "0") == "1":
+        say("  AVX1 floor: ggml-cpu is compiled for SSE4.2+AVX (runs on an AVX-only CPU; see WARM-RETUNABLE.md)")
+        return ["-DSTRATA_ISA_FLOOR=ON"]
+    return []
+
+
 def get_llama_cpp():
     """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
     llama = ROOT / "third_party" / "llama.cpp"
@@ -1635,7 +1653,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
-                 f"-DSTRATA_GGML_DIR={llama}"], None, "")
+                 f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs()], None, "")
     shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
             "lib_dirs": dirs, "src": src}
@@ -2013,7 +2031,8 @@ def build_engine(gpu, vision, yes, llama) -> Path:
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
         cmake_build(ROOT, ROOT / "build", "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}", *engine_defs(archs)],
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}", *engine_defs(archs),
+                     *isa_floor_defs()],
                     vcvars, "build-strata.bat")
         shutil.copy2(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:

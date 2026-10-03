@@ -841,12 +841,14 @@ if(STRATA_NATIVE_EXPERTS)
   # ---- THIS FORK: an ISA-floor build (AVX1 and up, one binary) ----
   # GGML_NATIVE=ON compiles ggml-cpu for the *build host*, so the engine carries that host's ISA and dies on
   # an older CPU with an illegal instruction.  STRATA_PORTABLE selects a fixed AVX2 baseline instead, which is
-  # still above an AVX-only machine (Sandy Bridge).  With STRATA_ISA_FLOOR=ON, ggml-cpu is built as one library
-  # per ISA - AVX1 (sandybridge) up to AVX-512 - and ggml picks the right one at run time, which is what the
-  # engine's fallback tier needs on an AVX-only CPU.  Per-ISA CPU libraries require backend DL, which is why
-  # GGML_BACKEND_DL has to be forced back on here (line 767 forces it off): the plugins land in
-  # <build>/bin/libggml-cpu-*.so and are found next to the binary or through GGML_BACKEND_PATH.
-  # AVX2/AVX-512 hosts are unaffected: they get the same code they had, chosen by the same dispatch.
+  # still above an AVX-only machine (Sandy Bridge).  With STRATA_ISA_FLOOR=ON, ggml-cpu is compiled ONCE for
+  # the AVX1 floor - ggml's own "sandybridge" feature set, SSE4.2 + AVX - so the engine also runs on a CPU
+  # that has neither AVX2 nor FMA/F16C.  The multi-variant route (one ggml-cpu per ISA, picked at run time)
+  # is NOT taken: see the block below.  Strata's own expert kernels keep their AVX2/AVX-512 TUs and their
+  # own run-time dispatch, so only the ggml-cpu tier moves down to the floor in this build.
+  # NOTE this switch is read but never declared with option(): a fresh build directory leaves it undefined
+  # (OFF), which silently produces a build-host-native engine.  setup.py passes it explicitly - see
+  # isa_floor_defs() - and a hand-run cmake must pass -DSTRATA_ISA_FLOOR=ON.
   if(STRATA_ISA_FLOOR)
     # A single ggml-cpu compiled for the AVX1 floor: the same idea as STRATA_PORTABLE (a fixed ISA baseline
     # instead of the build host's), one notch lower.  The feature set is ggml's own "sandybridge" variant
