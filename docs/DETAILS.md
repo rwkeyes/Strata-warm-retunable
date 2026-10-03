@@ -587,7 +587,33 @@ print(r.choices[0].message.content)
   later request carries (a request's own `strata_tune` in its body wins; `null` drops one). Unknown settings and
   unreadable values answer **400** and change nothing. The retunable engine keys and what each costs are in
   `warm-retune/RETUNE-CANDIDATES.md`; a key the engine cannot change in place is refused by the engine, which says
-  so in its own log line.
+  so in its own log line. The same call also sets the two response-shape knobs below (`{"strict_params": true}`,
+  `{"preserve_empty_think": true}`), so they need no restart either.
+- **Gating tool calls per request (`tool_choice`).** `"none"` means no tool may be called on that turn: the tools
+  payload is **not sent to the engine at all** (and MCP tools are not collected), because a lane that is never
+  offered a tool cannot call one whatever its chat template does with the field - the check that works on every
+  model. `"auto"` (the default) sends them as given; `{"type": "function", "function": {"name": "X"}}` (Anthropic:
+  `{"type": "tool", "name": "X"}`) offers **only** that function, so nothing else can be called; a name the request
+  does not offer is a **400**. `"required"` (Anthropic `{"type": "any"}`) is accepted but **reported as unenforced**
+  in the response - a chat template cannot force a call, and saying otherwise would be the same as ignoring the
+  field. Any other value is a 400: a choice this server cannot honour must not read as one it did.
+- **A request field this server does not implement is named, not ignored (`strict_params`).** Unknown top-level
+  fields are printed once each (with the API they came in on) and the request runs as before; with
+  `"strict_params": true` in `strata-<model>.json` they are a **400** listing them. Set it when you want a typo to
+  fail loudly instead of silently changing nothing.
+- **Every response says what ran (`strata`).** Non-streamed answers carry a top-level `"strata"` block, and a stream
+  carries it on its first chunk: `thinking`, `max_tokens` (the effective cap), `reasoning_budget_tokens` when
+  thinking, `tools_offered` (after `tool_choice`), the applied `tool_choice` (`{"requested": ..., "applied": ...,
+  "how"|"why": ...}`), and `sampling` in the engine's own spelling. A reply that spent its whole budget thinking and
+  so has no answer adds `"cap_hit": "reasoning"` - bucket those before scoring a model, or you are measuring the
+  budget. Nothing else changes: the block is additive and namespaced, so existing clients ignore it.
+- **A prior turn's empty thinking block is not rendered (`preserve_empty_think`).** When a conversation comes back
+  with an assistant turn whose reasoning was not sent (thinking was off for it, or the client dropped it), the
+  checkpoint's template writes an empty `<think></think>` wrapper. That nudges the model to think less on later
+  turns, and two histories that should render identically do not (so the conversation cache misses). This server
+  writes the wrapper only when there is reasoning to preserve; `"preserve_empty_think": true` in
+  `strata-<model>.json` or in a request's `chat_template_kwargs` restores the template's own rendering exactly.
+  Real reasoning is still preserved either way.
 - **No browser tab on start (`--no-open`).** Setup's launchers pass `--open`, which opens the web app in a browser as
   the model becomes ready — on a headless, kiosk or remote box that window lands somewhere unwanted. Add `--no-open`
   to the server's arguments (`serve/server.py --no-open ...`) or set `STRATA_NO_BROWSER=1`, which beats `--open`

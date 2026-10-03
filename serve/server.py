@@ -52,7 +52,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+                            images_of, offer_tools, openai_to_messages, tool_choice_of, unknown_params)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -1064,8 +1064,21 @@ class Service:
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        # Minefield 77: an unknown request field is named in the log, or - "strict_params": true - a 400.
+        # Minefield 04/25: "preserve_empty_think": true renders the pack's empty <think></think> for a prior
+        # assistant turn that has no reasoning; the default skips the empty wrapper.
+        self.strict_params = False
+        self.preserve_empty_think = False
+        self.params_warned = set()                        # field names already reported (once per server)
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+
+    def template_kwargs(self, kwargs: dict | None) -> dict:
+        """The request's template kwargs plus this server's defaults (the config's `preserve_empty_think`)."""
+        out = dict(kwargs or {})
+        if self.preserve_empty_think and "preserve_empty_think" not in out:
+            out["preserve_empty_think"] = True
+        return out
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1443,7 +1456,7 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
-        prompt = self.template.render(messages, tools=tools, **kwargs)
+        prompt = self.template.render(messages, tools=tools, **self.template_kwargs(kwargs))
         ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
@@ -1855,9 +1868,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, strata=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `strata`: the request's effective
+    settings, on the first chunk — a client reading the stream asserts on the same block a non-streamed response
+    carries (Minefield 77)."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
 
@@ -1865,7 +1880,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    first = chunk({"role": "assistant", "content": ""})
+    if strata:
+        first["strata"] = strata
+    yield first
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -1919,13 +1937,49 @@ def _is_json(text: str) -> bool:
         return False
 
 
+def check_params(req: dict, api: str, svc) -> list[str]:
+    """Minefield trap 77: name the request fields this server does not implement.
+
+    It used to accept any invented top-level field with a 200, so a misspelled parameter was silent and a status
+    code confirmed nothing.  Every field is now implemented, named here, or — with the config's `strict_params` —
+    a 400.  A name is printed once per server lifetime, so a typo in a loop cannot flood the log."""
+    unknown = unknown_params(req, api)
+    if not unknown:
+        return []
+    if svc.strict_params:
+        raise ValueError("unknown request parameter(s): " + ", ".join(sorted(unknown))
+                         + " — this server implements none of them (config \"strict_params\": true)")
+    fresh = [k for k in unknown if k not in svc.params_warned]
+    if fresh:
+        svc.params_warned.update(fresh)
+        print(f"[strata] {api}: ignoring request parameter(s) this server does not implement: "
+              f"{', '.join(sorted(fresh))}", flush=True)
+    return unknown
+
+
+def effective_settings(svc, req: dict, *, thinking, tools, tool_choice, max_new) -> dict:
+    """What this request actually ran with — the response's `strata` block (Minefield trap 77: the status code
+    confirms nothing, so a client must be able to assert on the response per request rather than per config).
+    The sampling string is the engine's own (`Service.sampling_keys`), not a second guess at it."""
+    out = {"thinking": bool(thinking), "max_tokens": max_new, "tools_offered": len(tools or []),
+           "tool_choice": tool_choice}
+    if thinking:
+        out["reasoning_budget_tokens"] = svc.reasoning_budget(req) or 0
+    sampling = StrataEngine.sampling_keys(req if isinstance(req, dict) else {}).strip()
+    if sampling:
+        out["sampling"] = sampling
+    return out
+
+
 def openai_collect(chunks) -> dict:
-    content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    content, reasoning, by_index, last, mcp, strata = [], [], {}, None, [], None
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
+        if c.get("strata"):
+            strata = c["strata"]                  # the request's effective settings, lifted to the response
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -1952,6 +2006,10 @@ def openai_collect(chunks) -> dict:
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if strata:
+        if out["choices"][0]["finish_reason"] == "length" and not msg.get("content") and msg.get("reasoning_content"):
+            strata = dict(strata, cap_hit="reasoning")   # Minefield 12: the budget went on thinking, not on an answer
+        out["strata"] = strata
     return out
 
 
@@ -2473,7 +2531,8 @@ def make_handler(svc: Service):
                      "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded(),
-                     **svc.api_key_policy(), "strata_tune": dict(svc.tune_defaults)}
+                     **svc.api_key_policy(), "strata_tune": dict(svc.tune_defaults),
+                     "strict_params": svc.strict_params, "preserve_empty_think": svc.preserve_empty_think}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -2502,7 +2561,8 @@ def make_handler(svc: Service):
             except (ValueError, TypeError) as e:
                 self._json(400, {"error": {"message": f"bad JSON body: {e}"}})
                 return
-            known = ("api_key_scope", "api_key_allow", "api_key", "strata_tune")
+            known = ("api_key_scope", "api_key_allow", "api_key", "strata_tune",
+                     "strict_params", "preserve_empty_think")
             unknown = [k for k in req if k not in known]
             if unknown:
                 self._json(400, {"error": {"message": f"unknown setting(s) {', '.join(sorted(unknown))} "
@@ -2535,15 +2595,25 @@ def make_handler(svc: Service):
                             svc.tune_defaults.pop(k, None)
                     svc.tune_defaults.update(clean_tune({k: v for k, v in tune.items() if v is not None}))
                     changed.append("strata_tune")
+                for name in ("strict_params", "preserve_empty_think"):   # the Minefield knobs, without a restart
+                    if name in req:
+                        if not isinstance(req[name], bool):
+                            raise ValueError(f"{name} must be true or false")
+                        setattr(svc, name, req[name])
+                        changed.append(name)
             except ValueError as e:
                 self._json(400, {"error": {"message": str(e)}})
                 return
             if changed:
                 print(f"[strata] POST /props changed {', '.join(changed)}: api_key_scope="
                       f"\"{svc.api_key_scope}\", api_key_allow={svc.api_key_allow or '[]'}, "
-                      f"key {'set' if svc.api_key else 'none'}, strata_tune={svc.tune_defaults or '{}'}", flush=True)
+                      f"key {'set' if svc.api_key else 'none'}, strata_tune={svc.tune_defaults or '{}'}, "
+                      f"strict_params={svc.strict_params}, preserve_empty_think={svc.preserve_empty_think}",
+                      flush=True)
             self._json(200, {"success": True, "changed": changed, **svc.api_key_policy(),
-                             "strata_tune": dict(svc.tune_defaults), "tune_keys": sorted(TUNE_KEYS)})
+                             "strata_tune": dict(svc.tune_defaults), "tune_keys": sorted(TUNE_KEYS),
+                             "strict_params": svc.strict_params,
+                             "preserve_empty_think": svc.preserve_empty_think})
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -2622,13 +2692,16 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            check_params(req, "openai", svc)                 # Minefield 77: name what this server does not implement
+            tc_mode, tc_name = tool_choice_of(req)           # Minefield 78: 400 on a choice it cannot honour
             messages, tools, kw = openai_to_messages(req)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            # tool_choice "none" means no tool may be called on this turn: the MCP tools are not even collected
+            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None and tc_mode != "none"
             own = {t.get("name") for t in tools or []}
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
@@ -2637,14 +2710,17 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
+            tools, tool_report = offer_tools(tools, tc_mode, tc_name)          # Minefield 78, after MCP joined
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            strata = effective_settings(svc, req, thinking=thinking, tools=tools, tool_choice=tool_report,
+                                        max_new=max_new)      # Minefield 77: the echo, per request
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, strata=strata)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -2687,17 +2763,22 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
+            check_params(req, "anthropic", svc)              # Minefield 77
+            tc_mode, tc_name = tool_choice_of(req, "anthropic")   # Minefield 78 (its own shapes: "any"/"tool")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            tools, tool_report = offer_tools(tools, tc_mode, tc_name)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            strata = effective_settings(svc, req, thinking=thinking, tools=tools, tool_choice=tool_report,
+                                        max_new=max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                return self._json(200, dict(anthropic_collect(events), strata=strata))
             self._sse()
             try:
                 for item in events:
@@ -3316,6 +3397,13 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
+    svc.strict_params = bool(cfg.get("strict_params"))       # Minefield 77: an unknown request field is a 400
+    svc.preserve_empty_think = bool(cfg.get("preserve_empty_think"))   # Minefield 04/25: the pack's rendering
+    if svc.strict_params:
+        print("[strata] strict_params: a request field this server does not implement is a 400", flush=True)
+    if svc.preserve_empty_think:
+        print("[strata] preserve_empty_think: a prior turn without reasoning keeps its empty <think> block",
+              flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)

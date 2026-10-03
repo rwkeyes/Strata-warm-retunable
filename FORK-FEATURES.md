@@ -20,6 +20,10 @@ Branch: **`warm-retune-sec`** (the published default branch is `warm-retunable`)
 | 5 | **AVX1 floor**: the engine runs on an AVX-only CPU | `CMakeLists.txt`, `src/kernels/cpu/kq_avx1.*`, `src/core/expert_source.cpp`, `setup.py` | no — build-time | measured on a Xeon E5-2687W and on gfx1100 (`WARM-RETUNABLE.md`) |
 | 6 | setup.py carries the llama.cpp patch and keeps `tools/ui` off Windows | `setup.py` | no | the build path is exercised by every setup run |
 | 7 | The retune **audit**: what else could be retuned, and in which class | `warm-retune/RETUNE-CANDIDATES.md` | — | source audit, file/line evidence |
+| 8 | **`tool_choice` is honoured** — `none` never offers the engine a tool | `serve/frontend.py`, `serve/server.py` | per request | 11 tests + the doctor's own probe |
+| 9 | A request field this server does not implement is **named**, and every response says **what ran** | `serve/frontend.py`, `serve/server.py` | `strict_params` (config / `POST /props`) | tests + the doctor's probe |
+| 10 | History without an **empty thinking block** | `serve/chat_template.jinja` | `preserve_empty_think` | 10 goldens byte-for-byte + tests |
+| 11 | The minefield findings, fixes and retest, in one place | `warm-retune/MINEFIELD-FINDINGS.md` | — | the doctor's own probes |
 
 ## 1 — The vendored llama.cpp runtime retune (llama-server)
 
@@ -143,7 +147,45 @@ AVX2/AVX-512 kernel units keep their ISA and runtime dispatch.
   path limit, #206) — `tools/CMakeLists.txt` adds it unconditionally when `LLAMA_BUILD_SERVER` is on, so
   without it no `llama-server` can even be configured from the vendored tree on Linux.
 
-## 7 — The retune audit (documentation, not code)
+## 8 — Tool calls can be gated per request (`tool_choice`)
+
+Upstream accepted `tool_choice` and **ignored** it — a *fails-open* defect: an agent loop with a side-effecting tool
+acts on a turn the caller believed was read-only (minefield trap 78). The fork implements it, and the enforcement is
+structural rather than a plea to the template:
+
+| `tool_choice` | what the fork does |
+|---|---|
+| absent / `"auto"` | offered as sent (unchanged) |
+| **`"none"`** | the tools payload is **not sent to the engine at all** — and the MCP tools are not even collected — so no template, parser or model state can call one |
+| `{"type": "function", "function": {"name": "X"}}` (Anthropic `{"type": "tool", "name": "X"}`) | only `X` is offered, so nothing else can be called; a name the request does not offer is a **400** |
+| `"required"` (Anthropic `{"type": "any"}`) | offered as sent, and reported **`applied: false`** with the reason: no chat template here can force a call |
+| anything else | **400**, because a choice this server cannot honour must not read as one it did |
+
+## 9 — The request surface is named, and every response says what ran
+
+Two halves of minefield trap 77 — a `200` used to confirm nothing:
+
+* **Unknown fields are named.** Anything outside the API's field set is printed once per server lifetime (with the
+  API it arrived on), so a typo is visible instead of silently doing nothing. `"strict_params": true` makes it a
+  **400** listing the fields, for deployments that would rather fail loudly.
+* **Every response carries the effective settings.** A top-level `"strata"` block (and the first chunk of a stream)
+  with `thinking`, the effective `max_tokens`, `reasoning_budget_tokens` when thinking, `tools_offered` after
+  `tool_choice`, the applied `tool_choice` report, `sampling` in the engine's own spelling, and `cap_hit:
+  "reasoning"` when a reply spent its whole budget thinking and so has no answer (trap 12 — bucket those before
+  scoring, or you are measuring the budget). Additive and namespaced: existing clients ignore it.
+
+## 10 — History without an empty thinking block
+
+Trap 04/25: when a conversation came back with an assistant turn whose reasoning was not resent, the template wrote
+`<think>\n\n</think>` into the prompt. That nudges the model to skip its reasoning on later turns, and makes two
+histories that should render identically differ — a conversation-cache miss. The fork writes the wrapper only when
+there is **reasoning to preserve**; `"preserve_empty_think": true` (config, a request's `chat_template_kwargs`, or
+`POST /props`) restores the checkpoint template's rendering exactly — verified byte-for-byte on all 10 golden cases,
+3 of which this changes. Real reasoning is preserved either way.
+
+Both new knobs are retunable while the server runs, like the API-key policy.
+
+## 11 — The retune audit (documentation, not code)
 
 `warm-retune/RETUNE-CANDIDATES.md` is the source-level audit behind feature 2: which parameters are read when
 they are *used* (retunable in place — the nine keys above, plus the ones still unwired: `--turn-token`, the PLE
@@ -161,6 +203,8 @@ change for an existing user, and they are the whole cost of features 2–3:
 |---|---|---|
 | With `api_key` set, **this PC and the LAN no longer need to present it** | that is the requested default (feature 3) | `"api_key_scope": "all"` |
 | With `api_key` set, **the `Host`/`Origin` checks are skipped only for a request that presents the key**, not for every request | exemptions would otherwise re-open the DNS-rebinding hole (a rebinding page arrives from an exempt `127.0.0.1`) | a tunnel that passes its own name on should send the key, or be listed in `allowed_hosts` |
+| **A prior assistant turn with no reasoning renders without the empty `<think></think>` wrapper** | the empty block nudges thinking collapse and costs the conversation cache (minefield 04/25) | `"preserve_empty_think": true` |
+| **`tool_choice: "none"` actually gates the turn** where upstream ignored it | ignoring it fails *open* (minefield 78) | nothing needed — an absent `tool_choice` behaves exactly as before |
 
 ## File map
 
@@ -179,15 +223,18 @@ src/core/expert_source.cpp,
 src/kernels/native_expert_parity.cpp                 feature 5 — the AVX1 expert-row path and dispatch
 setup.py                                             features 5,6
 serve/test_security.py                               45 tests: scope, allow list, POST /props, the checks' rules
+serve/test_minefield.py                              39 tests: one class per trap (78, 77, 12, 04/25), named after it
+warm-retune/MINEFIELD-FINDINGS.md                    the doctor's findings, the fixes, and the retest protocol
 WARM-RETUNABLE.md                                    per-feature measurements and caveats
 ```
 
 ## Verification status
 
-* **Features 2–4**: 214 tests green (test_security 45, test_server 121, lifecycle 8, mcp 25, monitor 7,
-  structured 8); `test_detok`'s 3 errors are pre-existing on v0.1.38.  Live HTTP smoke on a mock engine for
-  every row of features 3 and 4, plus the `POST /props` 401/200 split.  The engine half of feature 2
-  **compiles** (`g++ -fsyntax-only … 0 errors`) but has **not been run** on a pack yet.
+* **Features 2–4, 8–10**: **260 tests** green (test_minefield 39, test_security 45, test_server 121+,
+  lifecycle 8, mcp 25, monitor 7, structured 8); `test_detok`'s 3 errors are pre-existing on v0.1.38 (a missing
+  `regex` module in this environment).  Features 8–10 also carry the upstream minefield doctor's own probes; the
+  findings, the fixes and the retest protocol are in `warm-retune/MINEFIELD-FINDINGS.md`.  The engine half of
+  feature 2 compiles (`g++ -fsyntax-only … 0 errors`) but has **not been run** on a pack yet.
 * **Feature 1**: measured on an RX 7900 XTX (values quoted in `WARM-RETUNABLE.md`); the patch's content is
   identical to the original it was forward-ported from.
 * **Feature 5**: measured on a Xeon E5-2687W and on gfx1100; the floor's cost is a *null result* on gfx1100 and
