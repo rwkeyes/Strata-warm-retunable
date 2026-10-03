@@ -22,7 +22,7 @@ Branch: **`warm-retune-sec`** (the published default branch is `warm-retunable`)
 | 7 | The retune **audit**: what else could be retuned, and in which class | `warm-retune/RETUNE-CANDIDATES.md` | — | source audit, file/line evidence |
 | 8 | **`tool_choice` is honoured** — `none` never offers the engine a tool | `serve/frontend.py`, `serve/server.py` | per request | 11 tests + the doctor's own probe |
 | 9 | A request field this server does not implement is **named**, and every response says **what ran** | `serve/frontend.py`, `serve/server.py` | `strict_params` (config / `POST /props`) | tests + the doctor's probe |
-| 10 | History without an **empty thinking block** | `serve/chat_template.jinja` | `preserve_empty_think` | 10 goldens byte-for-byte + tests |
+| 10 | History without an **empty thinking block** (repo template **and** every pack) | `serve/chat_template.jinja`, `tools/empty_think_guard.py`, `tools/strata_tokenizer.py` | `preserve_empty_think` | 10 goldens byte-for-byte + the doctor's own probe clean |
 | 11 | The minefield findings, fixes and retest, in one place | `warm-retune/MINEFIELD-FINDINGS.md` | — | the doctor's own probes |
 
 ## 1 — The vendored llama.cpp runtime retune (llama-server)
@@ -186,6 +186,17 @@ there is **reasoning to preserve**; `"preserve_empty_think": true` (config, a re
 `POST /props`) restores the checkpoint template's rendering exactly — verified byte-for-byte on all 10 golden cases,
 3 of which this changes. Real reasoning is preserved either way.
 
+**Where the fix has to land matters here.** The server renders the **pack's** `tokenizer/chat_template.jinja` in
+preference to the repo's `serve/chat_template.jinja`, and that pack copy is extracted from the GGUF's own metadata
+by `tools/strata_tokenizer.py` — so editing the repo's template alone never reaches a running deployment. Hence:
+
+* `tools/empty_think_guard.py` — the guard as an idempotent, revertible, `--dry-run`-able replacement that leaves a
+  template it does not recognise exactly as the model shipped it;
+* `tools/strata_tokenizer.py` applies it as each pack is written (new packs carry it, and the tool's output is
+  byte-identical to `serve/chat_template.jinja` — a test asserts that, so the two cannot drift apart);
+* `~/bin/strata-fix-pack-template.sh [--undo|--check]` applies it to packs built before the fix, one backup per
+  template under `~/.backup/files/pack-template/`, with the restore command printed.
+
 Both new knobs are retunable while the server runs, like the API-key policy.
 
 ## 11 — The retune audit (documentation, not code)
@@ -226,18 +237,25 @@ src/kernels/cpu/iq_avx2.cpp,
 src/core/expert_source.cpp,
 src/kernels/native_expert_parity.cpp                 feature 5 — the AVX1 expert-row path and dispatch
 setup.py                                             features 5,6
-serve/test_security.py                               45 tests: scope, allow list, POST /props, the checks' rules
-serve/test_minefield.py                              39 tests: one class per trap (78, 77, 12, 04/25), named after it
-warm-retune/MINEFIELD-FINDINGS.md                    the doctor's findings, the fixes, and the retest protocol
+tools/empty_think_guard.py                           feature 10 — the guard a PACK's template gets
+tools/strata_tokenizer.py                            feature 10 — applies it as each pack is written
+serve/test_security.py                               47 tests: scope, allow list, POST /props, the checks' rules
+serve/test_minefield.py                              45 tests: one class per trap (78, 77, 12, 04/25), named after it
+warm-retune/MINEFIELD-FINDINGS.md                    the doctor's findings, the fixes, and the retest
 WARM-RETUNABLE.md                                    per-feature measurements and caveats
 ```
 
+Ops scripts (not in the repo, they drive a deployment):
+`~/bin/strata-fix-pack-template.sh` (the pack migration), `~/bin/strata-minefield-retest.sh` (the retest),
+`~/bin/strata-arm-run.sh` + `~/bin/strata-arm-diff.py` (the storage A/B).
+
 ## Verification status
 
-* **Features 2–4, 8–10**: **260 tests** green (test_minefield 39, test_security 45, test_server 121+,
+* **Features 2–4, 8–10**: **271 tests** green (test_minefield 45, test_security 47, test_server 121+,
   lifecycle 8, mcp 25, monitor 7, structured 8); `test_detok`'s 3 errors are pre-existing on v0.1.38 (a missing
-  `regex` module in this environment).  Features 8–10 also carry the upstream minefield doctor's own probes; the
-  findings, the fixes and the retest protocol are in `warm-retune/MINEFIELD-FINDINGS.md`.  The engine half of
+  `regex` module in this environment).  Features 8–10 also carry the upstream minefield doctor's own probes — 77,
+  78 and 04/25 come back **clean** on the retest, and the two that remain (12, 21) are properties of the lane and
+  the checkpoint, reported and remediable as `warm-retune/MINEFIELD-FINDINGS.md` sets out.  The engine half of
   feature 2 compiles (`g++ -fsyntax-only … 0 errors`) but has **not been run** on a pack yet.
 * **Feature 1**: measured on an RX 7900 XTX (values quoted in `WARM-RETUNABLE.md`); the patch's content is
   identical to the original it was forward-ported from.

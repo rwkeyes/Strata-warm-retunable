@@ -616,7 +616,12 @@ print(r.choices[0].message.content)
   turns, and two histories that should render identically do not (so the conversation cache misses). This server
   writes the wrapper only when there is reasoning to preserve; `"preserve_empty_think": true` in
   `strata-<model>.json` or in a request's `chat_template_kwargs` restores the template's own rendering exactly.
-  Real reasoning is still preserved either way.
+  Real reasoning is still preserved either way. **In a deployment the template that counts is the pack's**
+  (`Strata-data/packs/<pack>/tokenizer/chat_template.jinja`, which the server prefers to `serve/chat_template.jinja`
+  and which is extracted from the model's GGUF): packs built by this fork's `tools/strata_tokenizer.py` carry the
+  guard, and a pack built before it can be brought up to date with
+  `~/bin/strata-fix-pack-template.sh [--check|--undo]` (one backup per template, under
+  `~/.backup/files/pack-template/`).
 - **No browser tab on start (`--no-open`).** Setup's launchers pass `--open`, which opens the web app in a browser as
   the model becomes ready — on a headless, kiosk or remote box that window lands somewhere unwanted. Add `--no-open`
   to the server's arguments (`serve/server.py --no-open ...`) or set `STRATA_NO_BROWSER=1`, which beats `--open`

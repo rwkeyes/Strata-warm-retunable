@@ -306,6 +306,55 @@ class RetunableOverProps(HttpCase):
         self.assertIn("true or false", json.dumps(b))
 
 
+class EmptyThinkGuardModule(unittest.TestCase):
+    """The guard that goes into a PACK's template (tools/empty_think_guard.py).
+
+    The server renders the pack's `tokenizer/chat_template.jinja` in preference to the repo's file
+    (`server.py`: `ChatTemplate(pack_tpl if pack_tpl.exists() else ROOT / "serve/chat_template.jinja")`), and the
+    pack's copy is extracted from the GGUF metadata by `tools/strata_tokenizer.py` - so the same guard has to be
+    applied where a pack is built, and to packs built before the fix (`~/bin/strata-fix-pack-template.sh`).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import empty_think_guard as g
+        cls.g = g
+
+    def test_it_reproduces_the_repos_own_template_byte_for_byte(self):
+        """The guard's output IS serve/chat_template.jinja: the two paths cannot drift apart unnoticed."""
+        upstream = self.g.revert((ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))[0]
+        self.assertEqual(self.g.apply(upstream)[0], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+
+    def test_the_repo_template_is_already_guarded(self):
+        text = (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8")
+        self.assertEqual(self.g.apply(text)[1], "already guarded")
+
+    def test_an_unguarded_template_gains_the_guard_exactly_once(self):
+        upstream = self.g.revert((ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))[0]
+        once, what = self.g.apply(upstream)
+        self.assertEqual(what, "applied")
+        self.assertEqual(self.g.apply(once)[1], "already guarded")     # idempotent
+        self.assertIn("preserve_empty_think", once)
+
+    def test_revert_restores_the_checkpoints_template(self):
+        upstream = self.g.revert((ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))[0]
+        self.assertEqual(self.g.revert(self.g.apply(upstream)[0])[0], upstream)
+
+    def test_another_architectures_template_is_left_alone(self):
+        other = '{%- if message.role == "assistant" %}{{- content }}{%- endif %}'
+        got, what = self.g.apply(other)
+        self.assertEqual((got, what), (other, "pattern not found"))   # no guessing, no rewriting
+
+    def test_the_guarded_pack_render_skips_the_empty_wrapper(self):
+        t = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"},
+                   {"role": "user", "content": "again"}]
+        self.assertNotIn("<think>\n\n</think>", t.render(history, add_generation_prompt=False))
+        self.assertIn("<think>\n\n</think>",
+                      t.render(history, add_generation_prompt=False, preserve_empty_think=True))
+
+
 # --------------------------------------------------------------------------------------- 04/25 the empty think block
 class EmptyThinkTemplate(unittest.TestCase):
     """The vendored template's rendering of a prior assistant turn that has no reasoning."""
