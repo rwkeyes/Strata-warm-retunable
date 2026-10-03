@@ -134,7 +134,6 @@ class Lifecycle(unittest.TestCase):
         with self.svc.fifo:
             self.assertEqual(self.request("/v1/unload", {})[0], 409)
         self.svc.api_key = "local-secret"
-        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         self.assertEqual(self.request("/v1/unload", {})[0], 401)
         self.assertEqual(self.request("/v1/unload", {}, {"Authorization": "Bearer local-secret",
                                                         "Origin": "https://other.example"})[0], 403)

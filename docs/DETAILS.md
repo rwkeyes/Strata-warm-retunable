@@ -536,14 +536,17 @@ print(r.choices[0].message.content)
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   in an admin PowerShell, and make sure the network is set to Private.
 - **Who has to present that key (`api_key_scope`, `api_key_allow`).** A key protects the server; the scope says which
-  callers are already trusted by address and may skip it: `"api_key_scope": "lan"` (the default) exempts **this PC and
-  the local network** (the private ranges `10/8`, `172.16/12`, `192.168/16`, link-local, and IPv6's `fc00::/7` and
+  callers are already trusted by address and may skip it. **By default nobody skips it** — `"all"` is 0.1.38's
+  behaviour: the key is required from every caller, this PC included. An exemption is opt-in, chosen when the server
+  starts (`--api-key-scope`, or `"api_key_scope"` in the config, or `$STRATA_API_KEY_SCOPE`): `"lan"` exempts **this PC
+  and the local network** (the private ranges `10/8`, `172.16/12`, `192.168/16`, link-local, and IPv6's `fc00::/7` and
   `fe80::/10`), so a key for the tunnel does not mean typing it on every device at home; `"localhost"` exempts this PC
-  only; `"all"` exempts nobody (what 0.1.38 did: the key is required from every caller); `"off"` asks nobody for a key
-  (the check is off, for a server you protect some other way). `"api_key_allow": ["10.1.2.0/24", "192.168.4.7"]`
-  exempts named addresses and netblocks on top of the scope. Loopback is exempt in `lan` and `localhost` only; carrier
-  NAT (`100.64/10`) is deliberately not "your network". Both settings answer **400** if a value cannot be read. They are
-  also **retunable while the server runs** (see POST /props below), and a request naming one of these addresses in
+  only; `"off"` asks nobody for a key (the check is off, for a server you protect some other way).
+  `--api-key-allow "10.1.2.0/24,192.168.4.7"` (or `"api_key_allow": [...]`, or `$STRATA_API_KEY_ALLOW`) exempts named
+  addresses and netblocks on top of the scope — with the default scope it is the only thing that exempts anyone.
+  Loopback is exempt in `lan` and `localhost` only; carrier NAT (`100.64/10`) is deliberately not "your network". Both
+  settings answer **400** if a value cannot be read, and an unknown scope is refused at invocation. They are also
+  **retunable while the server runs** (see POST /props below), and a request naming one of these addresses in
   `Host` or `Origin` still has to pass those checks - see the two bullets below.
 - **From the internet.** Put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
   `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:

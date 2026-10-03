@@ -186,12 +186,13 @@ class OverHttp(HttpHarness, unittest.TestCase):
         self.assertIn("api_key", message)
 
     def test_with_a_key_the_host_check_off_only_for_authenticated_requests(self):
-        # A CHANGE from upstream 0.1.38, and the reason is api_key_scope: with a key set upstream skipped the
-        # Host check for EVERYONE, but scope "lan"/"localhost" exempts 127.0.0.1 from the key - and a DNS
+        # A CHANGE from upstream 0.1.38, and the reason is the opt-in exemption: with a key set upstream skipped
+        # the Host check for EVERYONE, but scope "lan"/"localhost" exempts 127.0.0.1 from the key - and a DNS
         # rebinding page arrives from 127.0.0.1 too.  So the check now runs for a request that does NOT present
         # the key, and is skipped for one that does: a tunnel or proxy that passes its own name on keeps working
-        # as long as it sends the key (or its name is in allowed_hosts).
-        self.start(api_key="s3cret")
+        # as long as it sends the key (or its name is in allowed_hosts).  The exemption itself is opt-in now -
+        # the default scope is upstream's "all", which exempts nobody - so it is asked for here.
+        self.start(api_key="s3cret", api_key_scope="lan")
         tunnel = "random-words.trycloudflare.com"
         self.assertEqual(self.req("GET", "/status", host=tunnel)[0], 403)
         self.assertIn("ev.example.com", self.req("GET", "/status", host="ev.example.com")[2])
@@ -205,7 +206,7 @@ class OverHttp(HttpHarness, unittest.TestCase):
         self.assertEqual(self.req("GET", "/status", headers={"Authorization": "Bearer wrong"}, host=tunnel)[0], 403)
         # the other way out, as before: name the tunnel in allowed_hosts (it feeds host_names at start)
         self.tearDown()
-        self.start(api_key="s3cret", allowed_hosts=[tunnel])
+        self.start(api_key="s3cret", api_key_scope="lan", allowed_hosts=[tunnel])
         self.assertEqual(self.req("GET", "/status", host=tunnel)[0], 200)    # this PC is exempt in scope "lan"
         self.assertEqual(self.req("GET", "/status", host="other.example.com")[0], 403)
 
@@ -266,9 +267,9 @@ class OverHttp(HttpHarness, unittest.TestCase):
 
     def test_with_a_key_the_key_decides(self):
         # With a key set the ORIGIN check is skipped for a caller that presents it (upstream's rule).  An
-        # exempt caller (this PC under scope "lan") does not need the key, so here the origin check still stands
-        # and refuses the foreign page: 403, not 401.
-        self.start(api_key="s3cret")
+        # exempt caller (this PC under scope "lan", opted into here - the default is upstream's "all") does not
+        # need the key, so here the origin check still stands and refuses the foreign page: 403, not 401.
+        self.start(api_key="s3cret", api_key_scope="lan")
         headers = {"Content-Type": "text/plain", "Origin": "http://evil.example.com"}
         code, body, _ = self.req("POST", "/v1/chat/completions", self.chat_body(), headers)
         self.assertEqual(code, 403)
@@ -296,7 +297,7 @@ class OverHttp(HttpHarness, unittest.TestCase):
 
 
 class ApiKeyScope(unittest.TestCase):
-    """Who has to present the key: the scope (lan | localhost | off) and the api_key_allow list."""
+    """Who has to present the key: the scope (all - the default - | lan | localhost | off) and api_key_allow."""
 
     def test_lan_scope_exempts_this_pc_and_the_local_network(self):
         for addr in ("127.0.0.1", "127.9.9.9", "::1", "10.0.0.7", "10.255.255.255", "172.16.0.1", "172.31.0.1",
@@ -361,20 +362,51 @@ class ApiKeyScope(unittest.TestCase):
     def test_service_layer_matches_the_pure_function(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        svc.api_key = "k"                          # the default policy: scope "lan", no allow list
-        self.assertFalse(svc.key_needed_for("192.168.5.5"))
-        self.assertFalse(svc.key_needed_for("127.0.0.1"))
-        self.assertTrue(svc.key_needed_for("8.8.8.8"))
+        self.assertEqual(svc.api_key_scope, "all")  # the default: upstream 0.1.38, no exemption at all
+        svc.api_key = "k"
+        for addr in ("127.0.0.1", "::1", "192.168.5.5", "10.0.0.1", "8.8.8.8"):
+            self.assertTrue(svc.key_needed_for(addr), addr)
         policy = svc.set_api_key_policy(scope="LAN", allow=["10.0.0.0/8"])
         self.assertEqual(policy["api_key_scope"], "lan")
         self.assertEqual(policy["api_key_allow"], ["10.0.0.0/8"])
         self.assertTrue(policy["api_key"])
+        self.assertFalse(svc.key_needed_for("192.168.5.5"))     # now the local network is exempt
+        self.assertFalse(svc.key_needed_for("127.0.0.1"))
+        self.assertTrue(svc.key_needed_for("8.8.8.8"))
         with self.assertRaises(ValueError):
             svc.set_api_key_policy(scope="wan")
         with self.assertRaises(ValueError):
             svc.set_api_key_policy(allow=["nope"])
         self.assertEqual(svc.api_key_scope, "lan")             # a refused call changed nothing
         self.assertEqual(svc.api_key_allow, ["10.0.0.0/8"])
+
+    def test_the_default_asks_everyone_exactly_as_upstream_did(self):
+        """No scope given anywhere: the key is required from every caller, this PC included (0.1.38's behaviour)."""
+        self.assertTrue(key_needed_for("127.0.0.1", "k"))       # the pure function's own default too
+        self.assertTrue(key_needed_for("192.168.1.5", "k"))
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertEqual(svc.api_key_scope, "all")
+        svc.api_key = "k"
+        for addr in ("127.0.0.1", "::1", "192.168.1.5", "10.0.0.1", "fd00::1", "8.8.8.8", "not-an-ip"):
+            self.assertTrue(svc.key_needed_for(addr), addr)
+        svc.api_key = ""                                        # nothing to be exempt from, so nothing asked
+        for addr in ("127.0.0.1", "8.8.8.8"):
+            self.assertFalse(svc.key_needed_for(addr), addr)
+
+    def test_the_scope_and_allow_list_are_invocation_flags(self):
+        """The policy can be chosen on the command line, not only through POST /props."""
+        import subprocess
+        p = subprocess.run([sys.executable, str(ROOT / "serve/server.py"), "--help"],
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for flag in ("--api-key-scope", "--api-key-allow"):
+            self.assertIn(flag, p.stdout)
+        self.assertIn("all", p.stdout)
+        bad = subprocess.run([sys.executable, str(ROOT / "serve/server.py"), "--api-key-scope", "wan"],
+                             capture_output=True, text=True, timeout=180)
+        self.assertEqual(bad.returncode, 2)                     # argparse refuses a scope that is not one of them
+        self.assertIn("invalid choice", bad.stderr)
 
 
 class TuneKeys(unittest.TestCase):
@@ -456,7 +488,7 @@ class PropsOverHttp(HttpHarness, unittest.TestCase):
 
     def test_props_needs_the_key_when_one_is_set(self):
         # the exempt address must not be able to turn the exemption into everyone's
-        self.start(api_key="s3cret")                     # scope "lan": this PC is exempt from the key
+        self.start(api_key="s3cret", api_key_scope="lan")   # an exempting scope: this PC skips the key
         code, body, _ = self.req("POST", "/props", {"api_key_scope": "off"}, {"Content-Type": "application/json"})
         self.assertEqual(code, 401)
         self.assertIn("api_key_scope", body["error"]["message"])
@@ -513,7 +545,7 @@ class PropsOverHttp(HttpHarness, unittest.TestCase):
         self.assertEqual((code, body["changed"]), (200, []))
 
     def test_props_from_a_foreign_page_or_a_form_is_refused(self):
-        self.start(api_key="s3cret")
+        self.start(api_key="s3cret", api_key_scope="lan")   # an exempting scope: this PC skips the key
         self.assertEqual(self.req("POST", "/props", {"api_key_scope": "off"},
                                   {**self.HDR, "Origin": "http://evil.example.com"})[0], 403)
         self.assertEqual(self.req("POST", "/props", b"a=1",

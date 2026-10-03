@@ -248,9 +248,6 @@ class StatusNeedsTheKey(unittest.TestCase):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         svc.api_key = "k3y"
-        # api_key_scope "lan" (the default) exempts this PC: this test is about what "all" (upstream's
-        # behaviour, no exemption) does, so it asks for it explicitly
-        svc.api_key_scope = "all"
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}/status"
         try:
@@ -1253,7 +1250,6 @@ class SharedSettings(unittest.TestCase):
 
     def test_they_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
-        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         try:
             self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}})[0], 401)
             self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}},
@@ -1378,7 +1374,6 @@ class WebApp(unittest.TestCase):
 
     def test_discovery_needs_the_api_key(self):
         self.svc.api_key = "secret"
-        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         try:
             for path in ("/models", "/v1/models", "/props", "/slots"):
                 self.assertEqual(self.get(path)[0], 401)
@@ -1422,7 +1417,6 @@ class WebApp(unittest.TestCase):
 
     def test_metrics_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
-        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         try:
             self.assertEqual(self.get("/metrics")[0], 401)
             self.assertEqual(self.get("/metrics", {"Authorization": "Bearer secret"})[0], 200)

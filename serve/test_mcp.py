@@ -419,7 +419,6 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(st["tools"], len(fake.TOOLS))
         self.assertEqual(st["settings"]["max_rounds"], 2)
         self.svc.api_key = "k"
-        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         with self.assertRaises(urllib.error.HTTPError):
             urllib.request.urlopen(self.base + "/mcp", timeout=10)
         self.svc.api_key = ""

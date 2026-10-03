@@ -6,9 +6,10 @@ A fork of [Strata](https://github.com/Niko1221/Strata) **v0.1.38** carrying what
    context and KV pool **without reloading the weights**,
 2. the same idea for **Strata's own engine**: a `TUNE` line on its serve protocol and a `POST /props` that
    stores defaults, so the knobs that are read per request can be changed under a running server,
-3. an **API-key scope** — the key can be required from everyone (upstream's behaviour), from everything but
-   this PC, or from everything but this PC and the local network (the default), plus an ALLOW list of
-   addresses/netblocks, all retunable while it runs,
+3. an **API-key scope** — by default the key is required from everyone, exactly as upstream; an exemption
+   (this PC, or this PC and the local network) is opt-in when the server starts (`--api-key-scope`,
+   `--api-key-allow`, the config keys or the environment) and retunable while it runs, turning the security
+   feature off or listing specific addresses/netblocks on an ALLOW list,
 4. **`--no-open` / `$STRATA_NO_BROWSER`** — a start that must not pop a browser tab (kiosk, headless, remote),
 5. an **AVX1 floor** build — SSE4.2 + AVX, `STRATA_ISA_FLOOR=ON` — so the engine also runs on an AVX-only
    CPU (a Sandy Bridge Xeon), which upstream's AVX2 baseline refuses with an illegal instruction
@@ -121,30 +122,33 @@ what an end user might still want from it.
 
 ## The API key's scope
 
-Upstream 0.1.38 sets `api_key` and then requires it from **every** caller. This fork keeps that as an option
-and adds the scope a home LAN wants:
+Upstream 0.1.38 sets `api_key` and then requires it from **every** caller. **That is this fork's default too:**
+nothing changes unless you ask for an exemption, and you ask for it when the server starts — `--api-key-scope`
+(`--api-key-allow` for named addresses), or `"api_key_scope"` / `"api_key_allow"` in the config, or
+`$STRATA_API_KEY_SCOPE` / `$STRATA_API_KEY_ALLOW`.
 
 | `api_key_scope` | who skips the key |
 |---|---|
-| `lan` (**the default**) | this PC **and the local network**: `10/8`, `172.16/12`, `192.168/16`, link-local, IPv6's `fc00::/7` and `fe80::/10` |
+| `all` (**the default**) | nobody — the key is required from every caller, this PC included (0.1.38's behaviour) |
+| `lan` | this PC **and the local network**: `10/8`, `172.16/12`, `192.168/16`, link-local, IPv6's `fc00::/7` and `fe80::/10` |
 | `localhost` | this PC only |
-| `all` | nobody — upstream's behaviour, restorable with one setting |
 | `off` | nobody is asked for a key at all (the feature is off) |
 
 `"api_key_allow": ["10.1.2.0/24", "192.168.4.7"]` (also `--api-key-allow`, `$STRATA_API_KEY_ALLOW`) exempts
-named addresses and netblocks on top of the scope; `lan` and `localhost` honour it, `all` does not. Carrier
-NAT (`100.64/10`) is deliberately *not* "your network". An unreadable peer address needs the key (fail
-closed). Set either with the config key, the CLI flag (`--api-key-scope`), or the environment
-(`$STRATA_API_KEY_SCOPE`), and **change both while it runs**:
+named addresses and netblocks on top of the scope; `lan` and `localhost` honour it, `all` does not — under the
+default scope it is the only thing that exempts anyone. Carrier NAT (`100.64/10`) is deliberately *not* "your
+network". An unreadable peer address needs the key (fail closed). An unknown scope is refused at invocation
+(argparse) and a bad value in POST /props answers 400. **Change either while it runs:**
 
 ```sh
+./serve/server.py --api-key-scope lan --api-key-allow 10.1.0.0/16   # chosen at invocation
 curl -s localhost:8080/props | jq '{api_key, api_key_scope, api_key_allow}'
 curl -s -X POST localhost:8080/props -d '{"api_key_scope": "localhost", "api_key_allow": ["10.1.0.0/16"]}'
 curl -s -X POST localhost:8080/props -d '{"api_key_scope": "off"}'      # the check off, for the whole server
 curl -s -X POST localhost:8080/props -d '{"api_key": ""}'               # no key at all
 ```
 
-**Two behaviours changed, on purpose, and they are the interesting part:**
+**Two behaviours change, on purpose, and only once an exemption is in play:**
 
 * **Changing the policy needs the key when one is set** — `POST /props` ignores the scope for this, so an
   exempt LAN client cannot switch its own exemption off for everybody.

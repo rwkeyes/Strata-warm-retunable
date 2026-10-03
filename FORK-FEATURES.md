@@ -15,7 +15,7 @@ Branch: **`warm-retune-sec`** (the published default branch is `warm-retunable`)
 |---|---|---|---|---|
 | 1 | llama-server re-shapes itself: slots, per-slot context, KV pool, cache types — weights resident | `warm-retune/retune-llama-server-3cf0325.patch` (vendored llama.cpp `tools/server`) | yes — `POST /props` | upstream patch: measured (0–0.4 ms re-slice, ~0.8 s context rebuild) |
 | 2 | **Strata's own engine** re-tunes without a restart | `src/program/generate.cpp` (`TUNE`), `serve/server.py` (`POST /props`) | yes — the whole point | tests + live HTTP; engine side compile-verified, not yet run on a GPU |
-| 3 | API-key **scope** + **ALLOW list** (LAN permitted by default, feature can be off) | `serve/server.py` | yes — `POST /props` | 45 security tests + live smoke |
+| 3 | API-key **scope** + **ALLOW list** (upstream's behaviour by default, exemption opt-in at invocation) | `serve/server.py` | yes — `POST /props` and the CLI flags | 47 security tests + live smoke |
 | 4 | A start that does **not** pop a browser tab | `serve/server.py` (`--no-open`, `$STRATA_NO_BROWSER`) | no — invocation-time by design | tests + `--help` |
 | 5 | **AVX1 floor**: the engine runs on an AVX-only CPU | `CMakeLists.txt`, `src/kernels/cpu/kq_avx1.*`, `src/core/expert_source.cpp`, `setup.py` | no — build-time | measured on a Xeon E5-2687W and on gfx1100 (`WARM-RETUNABLE.md`) |
 | 6 | setup.py carries the llama.cpp patch and keeps `tools/ui` off Windows | `setup.py` | no | the build path is exercised by every setup run |
@@ -82,28 +82,31 @@ curl -s -X POST localhost:8080/props -H 'Content-Type: application/json' \
 
 ## 3 — The API key's scope, and who may skip it
 
-Upstream 0.1.38 sets `api_key` and then requires it from **every** caller.  The fork makes that a policy:
+Upstream 0.1.38 sets `api_key` and then requires it from **every** caller.  **That is this fork's default**, so
+nothing changes unless you ask: the exemption is chosen when the server starts and can be changed while it runs.
 
 | `api_key_scope` | who skips the key |
 |---|---|
-| **`lan` (default)** | this PC **and the local network** — `10/8`, `172.16/12`, `192.168/16`, link-local, IPv6 `fc00::/7` and `fe80::/10` |
+| **`all` (default)** | nobody — the key is required from every caller, this PC included (upstream's behaviour) |
+| `lan` | this PC **and the local network** — `10/8`, `172.16/12`, `192.168/16`, link-local, IPv6 `fc00::/7` and `fe80::/10` |
 | `localhost` | this PC only |
-| `all` | nobody — upstream's behaviour, one setting away |
 | `off` | nobody is asked at all (the check is off) |
 
-`"api_key_allow": ["10.1.2.0/24", "192.168.4.7"]` exempts named addresses and netblocks on top of the scope.
-An explicit netblock is parsed strictly (a host inside a network is a typo, refused), a bare address is a /32
-(/128 in IPv6), and an unreadable peer address needs the key (fail closed).  Carrier-grade NAT (`100.64/10`) is
-deliberately *not* "your network".  Set with the config key, `--api-key-scope` / `--api-key-allow`, or
-`$STRATA_API_KEY_SCOPE` / `$STRATA_API_KEY_ALLOW`, and **change both while it runs**:
+`"api_key_allow": ["10.1.2.0/24", "192.168.4.7"]` exempts named addresses and netblocks on top of the scope —
+under the default scope it is the only thing that exempts anyone.  An explicit netblock is parsed strictly (a
+host inside a network is a typo, refused), a bare address is a /32 (/128 in IPv6), and an unreadable peer address
+needs the key (fail closed).  Carrier-grade NAT (`100.64/10`) is deliberately *not* "your network".  Chosen at
+invocation — `--api-key-scope` / `--api-key-allow`, `"api_key_scope"` / `"api_key_allow"` in the config, or
+`$STRATA_API_KEY_SCOPE` / `$STRATA_API_KEY_ALLOW` — and **changeable while it runs**:
 
 ```sh
+./serve/server.py --api-key-scope lan --api-key-allow 10.1.0.0/16   # the exemption, opted into at invocation
 curl -s -X POST localhost:8080/props -H 'Content-Type: application/json' \
      -d '{"api_key_scope": "localhost", "api_key_allow": ["10.1.0.0/16"]}'
 curl -s -X POST localhost:8080/props -H 'Content-Type: application/json' -d '{"api_key": ""}'
 ```
 
-Two rules make it safe to hand out exemptions:
+Two rules make it safe to hand out exemptions (they only bite once one is in play):
 
 * **Changing the policy needs the key when one is set** — `POST /props` ignores the scope for this, so an
   exempt LAN client cannot turn its own exemption off for everybody.
@@ -196,13 +199,14 @@ not imagine can see what is cheap to add.
 
 ## What the fork does NOT change
 
-Everything else is upstream's behaviour, including the defaults a user already relies on.  Two things do
-change for an existing user, and they are the whole cost of features 2–3:
+Everything else is upstream's behaviour, including the defaults a user already relies on.  The API key is one of
+them: **with no flags or config, this server behaves exactly as 0.1.38 did** — the key is required from every
+caller — and upstream's own test files are byte-identical here, which is the check that keeps it that way.  These
+are the changes an existing user can actually meet:
 
 | change | why | how to get upstream's behaviour back |
 |---|---|---|
-| With `api_key` set, **this PC and the LAN no longer need to present it** | that is the requested default (feature 3) | `"api_key_scope": "all"` |
-| With `api_key` set, **the `Host`/`Origin` checks are skipped only for a request that presents the key**, not for every request | exemptions would otherwise re-open the DNS-rebinding hole (a rebinding page arrives from an exempt `127.0.0.1`) | a tunnel that passes its own name on should send the key, or be listed in `allowed_hosts` |
+| With `api_key` set, the **`Host`/`Origin` checks are skipped only for a request that presents the key**, not for every request | an address exemption would otherwise re-open the DNS-rebinding hole (a rebinding page arrives from an exempt `127.0.0.1`) | a tunnel that passes its own name on should send the key, or be listed in `allowed_hosts` |
 | **A prior assistant turn with no reasoning renders without the empty `<think></think>` wrapper** | the empty block nudges thinking collapse and costs the conversation cache (minefield 04/25) | `"preserve_empty_think": true` |
 | **`tool_choice: "none"` actually gates the turn** where upstream ignored it | ignoring it fails *open* (minefield 78) | nothing needed — an absent `tool_choice` behaves exactly as before |
 

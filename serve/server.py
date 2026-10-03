@@ -68,11 +68,12 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 # while the tunnel in front of the server still does.  "lan" (the default) exempts this PC and the local network,
 # "localhost" exempts this PC only, "all" exempts nobody (upstream 0.1.38's behaviour: the key is required from
 # every caller, loopback included), "off" asks nobody for a key (the feature is off).
-API_KEY_SCOPES = ("lan", "localhost", "all", "off")
+API_KEY_SCOPES = ("all", "lan", "localhost", "off")
 # What "the local network" means: the private ranges (RFC 1918), link-local (auto-configuration addresses) and
 # IPv6's unique-local (fc00::/7) plus link-local (fe80::/10).  Loopback is exempt in the "lan" and "localhost"
 # scopes (never in "all"); the allow list applies in those two as well.  Carrier-grade NAT (100.64.0.0/10) is
-# deliberately NOT here: it is an ISP's network, not yours.
+# deliberately NOT here: it is an ISP's network, not yours.  The DEFAULT scope is "all" - upstream 0.1.38's
+# behaviour, every caller presents the key - so these exemptions are only ever opt-in.
 LAN_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10")
 LOOPBACK_NETS = ("127.0.0.0/8", "::1/128")
 # RUNTIME TUNE KEYS: engine settings a running server may change without a restart (see
@@ -1024,7 +1025,10 @@ class Service:
         # Who is exempt from that key (see API_KEY_SCOPES / LAN_NETS): the scope, plus api_key_allow, an ALLOW
         # list of addresses and netblocks ("10.0.0.0/8", "192.168.4.7").  Both are retunable at runtime through
         # POST /props; `api_key_nets` is the parsed form of the list, kept so the request path does no parsing.
-        self.api_key_scope = "lan"
+        # The DEFAULT is upstream 0.1.38's behaviour: every caller must present the key, this PC included.  An
+        # exemption is opt-in, chosen when the server starts (--api-key-scope / "api_key_scope" /
+        # $STRATA_API_KEY_SCOPE).
+        self.api_key_scope = "all"
         self.api_key_allow: list[str] = []
         self.api_key_nets: tuple = ()                  # parse_netblocks(api_key_allow), kept for the request path
         # POST /props: engine tune keys that apply to every later request (a request's own `strata_tune` wins)
@@ -2542,7 +2546,8 @@ def make_handler(svc: Service):
 
         def _props_set(self):
             """POST /props - the server's retunable settings, in one place with GET /props:
-                {"api_key_scope": "lan"|"localhost"|"off"}   who skips the API key (see API_KEY_SCOPES)
+                {"api_key_scope": "all"|"lan"|"localhost"|"off"}  who skips the API key ("all" = the default:
+                                                                  nobody: upstream 0.1.38's behaviour)
                 {"api_key_allow": ["10.0.0.0/8", "192.168.4.7"]}  and which addresses do, on top of the scope
                 {"api_key": "..."}                          the key itself ("" = none: the API becomes open)
                 {"strata_tune": {"prefill": 4096, ...}}      engine keys every later request carries
@@ -3016,11 +3021,11 @@ def in_netblocks(addr, nets) -> bool:
     return any(ip.version == n.version and ip in n for n in nets)
 
 
-def key_needed_for(addr, api_key, scope: str = "lan", nets=()) -> bool:
+def key_needed_for(addr, api_key, scope: str = "all", nets=()) -> bool:
     """Does this peer address have to present the API key?  False when no key is set, or the scope is "off";
-    "all" asks everyone; otherwise this PC never needs it, then the allow list (api_key_allow), then - with scope
-    "lan" - the local network.  An address that cannot be read needs the key (fail closed): a malformed peer
-    address must not be an exemption."""
+    "all" (the default, and upstream 0.1.38's behaviour) asks everyone including this PC; otherwise this PC never
+    needs it, then the allow list (api_key_allow), then - with scope "lan" - the local network.  An address that
+    cannot be read needs the key (fail closed): a malformed peer address must not be an exemption."""
     if not api_key or scope == "off":
         return False
     if scope == "all":                                 # upstream 0.1.38: the key is required from every caller
@@ -3233,11 +3238,13 @@ def main() -> int:
                     help="require this key on /v1/* (Authorization: Bearer *** or x-api-key); also $STRATA_API_KEY")
     ap.add_argument("--api-key-scope", default=os.environ.get("STRATA_API_KEY_SCOPE") or None,
                     choices=list(API_KEY_SCOPES),
-                    help="who is exempt from that key: \"lan\" (default: this PC AND the local network - the "
-                         "private/link-local ranges skip the key), \"localhost\" (this PC only), \"off\" (nobody "
-                         "needs it); also \"api_key_scope\" in the config or $STRATA_API_KEY_SCOPE")
+                    help="who is exempt from that key - default \"all\": every caller must present it, exactly as "
+                         "0.1.38 did. \"lan\" exempts this PC AND the local network (the private/link-local "
+                         "ranges), \"localhost\" this PC only, \"off\" nobody needs it; also \"api_key_scope\" in "
+                         "the config or $STRATA_API_KEY_SCOPE")
     ap.add_argument("--api-key-allow", default=os.environ.get("STRATA_API_KEY_ALLOW") or None, metavar="LIST",
-                    help="addresses that skip the key on top of the scope, comma-separated: "
+                    help="addresses that skip the key on top of the scope, comma-separated "
+                         "(needed with the default scope \"all\", which exempts nobody): "
                          "\"10.1.2.0/24,192.168.4.7\"; also \"api_key_allow\" in the config or "
                          "$STRATA_API_KEY_ALLOW")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
@@ -3342,22 +3349,25 @@ def main() -> int:
               file=sys.stderr)
         return 2
     svc.api_key = a.api_key or cfg.get("api_key", "")
-    # Who is exempt from that key (0.1.38's api_key): the scope - "lan" (default) for this PC and the local
-    # network, "localhost" for this PC only, "off" for nobody - plus api_key_allow, an ALLOW list of addresses and
-    # netblocks.  Both are retunable while it runs: POST /props {"api_key_scope": .., "api_key_allow": [..]}.
+    # Who is exempt from that key (0.1.38's api_key): the scope - "all" (the default: nobody, every caller
+    # presents the key, exactly as upstream), "lan" for this PC and the local network, "localhost" for this PC
+    # only, "off" for nobody needing it - plus api_key_allow, an ALLOW list of addresses and netblocks.  Chosen
+    # at invocation (--api-key-scope / --api-key-allow, or the two config keys / $STRATA_API_KEY_SCOPE /
+    # $STRATA_API_KEY_ALLOW) and retunable while it runs: POST /props {"api_key_scope": .., "api_key_allow": [..]}.
     try:
         allow_value = a.api_key_allow if a.api_key_allow is not None else cfg.get("api_key_allow")
         svc.api_key_allow = api_key_allow_of(allow_value)
         svc.api_key_nets = parse_netblocks(svc.api_key_allow)
-        svc.api_key_scope = a.api_key_scope or cfg.get("api_key_scope") or "lan"
+        svc.api_key_scope = a.api_key_scope or cfg.get("api_key_scope") or "all"
         if svc.api_key_scope not in API_KEY_SCOPES:
             raise ValueError(f"api_key_scope must be one of {', '.join(API_KEY_SCOPES)}, not "
                              f"{svc.api_key_scope!r}")
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
     if svc.api_key:
-        where = {"lan": "this PC and the local network", "localhost": "this PC",
-                 "all": "no one (every caller must present it)",
+        where = {"all": "no one: every caller must present it (0.1.38's behaviour)",
+                 "lan": "this PC and the local network",
+                 "localhost": "this PC",
                  "off": "nobody (the key is NOT checked: api_key_scope \"off\")"}[svc.api_key_scope]
         print(f"[strata] API key: required from every address except {where}"
               + (f", plus {', '.join(svc.api_key_allow)} (api_key_allow)" if svc.api_key_allow else "")
