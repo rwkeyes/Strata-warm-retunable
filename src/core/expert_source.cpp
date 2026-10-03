@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -905,8 +906,34 @@ void RouterLookahead::run() {
         }
         const auto t0 = std::chrono::steady_clock::now();
         want.clear();
-        strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                  x_.data(), (int) nt, logits.data());
+        // THIS FORK: bf16_rows_dot_multi lives in kq_avx2.cpp, which is compiled with -mavx2, so calling it
+        // on a CPU without AVX2 is an illegal instruction - and this is the first thing a prediction does.
+        // An AVX-only host (Xeon E5 v1/v2) therefore STARTED fine and died here on the first request
+        // (observed: SIGILL in bf16_rows_dot_multi+0x1d9, `vpmovzxwd`, on a Xeon E5-2687W).  The AVX2 kernel
+        // is unchanged wherever AVX2 exists; below it the same arithmetic runs scalar in THIS file, which
+        // carries no per-source ISA flags - that is the reason it lives here rather than in kq_avx2.cpp.
+        // The router is documented as an estimate, and the loop mirrors the kernel exactly: bf16 -> f32 by
+        // shifting into the high half, fused multiply-add, one accumulator per (token,row), c ascending.
+        if (strata::kernels::cpu::cpu_avx2_ok()) {
+            strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+                                                      x_.data(), (int) nt, logits.data());
+        } else {
+            const uint16_t* rw = routers_[(size_t) layer].data();
+            for (int64_t r = 0; r < n_expert_; ++r) {
+                const uint16_t* wr = rw + (size_t) r * (size_t) n_embd_;
+                for (int64_t t = 0; t < nt; ++t) {
+                    const float* xr = x_.data() + (size_t) t * (size_t) n_embd_;
+                    float acc = 0.0f;
+                    for (int64_t c = 0; c < n_embd_; ++c) {
+                        const uint32_t bits = (uint32_t) wr[c] << 16;
+                        float wf;
+                        std::memcpy(&wf, &bits, sizeof wf);
+                        acc = std::fma(wf, xr[c], acc);
+                    }
+                    logits[(size_t) t * (size_t) n_expert_ + (size_t) r] = acc;
+                }
+            }
+        }
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
