@@ -80,7 +80,8 @@ connect your apps. AI tools can also install, start and stop Strata themselves t
 The same steps for NVIDIA and AMD: the installer finds your card and sets up the right engine for it. It asks which
 model, which size, how much context (how much text it keeps in mind) and whether it should read pictures - press
 Enter each time for the recommended answer. Then it downloads the model (~70 GB; you can stop and it continues where
-it left off) and starts it. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+it left off) and starts it. Your browser opens the Strata app at `http://127.0.0.1:8080` (a headless or kiosk start
+can pass `--no-open` to the server, or set `STRATA_NO_BROWSER=1`).
 
 > **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
 > loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the

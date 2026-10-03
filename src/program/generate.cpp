@@ -5046,6 +5046,83 @@ int main(int argc, char** argv) {
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // ================================ plan v0.3 P8: THE RUNTIME RETUNE (TUNE) ================================
+        //
+        // A line `TUNE prefill=4096 spec_min_p=0.4 ...` changes settings of the RUNNING engine, between requests,
+        // without a restart and without touching the weights, the expert tiers or the session state.  It exists
+        // because most of the knobs below are read out of `o` at the moment they are USED - the per-request
+        // lambdas capture `o` by reference - so writing `o` here is what makes a change take effect on the next
+        // request; nothing is copied anywhere else.  Two are NOT of that kind and are handled explicitly:
+        //
+        //   * `prefill` - the prompt-path buffers were sized from `o.prefill_chunk` at load (`160 + chunk*680/1024`
+        //     MiB, plus the slots a chunk borrows), so a chunk may go DOWN any time and only up to the startup
+        //     value; `tune_prefill_max` is that ceiling and the reply says what was applied.
+        //   * `mtp_max_t` - the MTP's window cap was baked into `mtp.set_max_drafts()` before this loop, and the
+        //     setter is called again here (it is a plain field write, and a TUNE line only arrives between
+        //     requests, so nothing is running).
+        //   * `suffix_draft` likewise: the SuffixDrafter's slots were sized at startup (`tune_suffix_max`).
+        //
+        // Deliberately NOT retunable this way: `--spec` (the draft depth `S` is const here and the verify
+        // geometry is built from it), the `--kv`/`--max-context` family (session state), the expert tiers
+        // (allocated), and every `--native-*`/graph flag (baked into captured graphs - see session.hpp).  Those
+        // are the rebuild class, not the in-place class.
+        const int64_t tune_prefill_max = o.prefill_chunk > 0 ? o.prefill_chunk : 0;
+        const int tune_suffix_max = o.suffix_draft;
+        auto handle_tune = [&](const std::string& l) {
+            std::string applied, refused;
+            std::istringstream in(l.size() > 4 ? l.substr(5) : std::string());
+            std::string kv;
+            while (in >> kv) {
+                const size_t eq = kv.find('=');
+                const std::string k = eq == std::string::npos ? kv : kv.substr(0, eq);
+                char* end = nullptr;
+                const double v = eq == std::string::npos ? 0.0
+                                                        : std::strtod(kv.c_str() + (ptrdiff_t) eq + 1, &end);
+                // a value must be a number and must be there: "prefill=abc" is a typo, not a request for 0
+                const bool known = eq != std::string::npos && end != nullptr && end != kv.c_str() + eq + 1 &&
+                                   *end == '\0' && v >= 0.0;
+                const auto num = [&](int64_t x) { return std::to_string((long long) x); };
+                if (known && k == "prefill") {
+                    o.prefill_chunk = std::min<int64_t>((int64_t) v, tune_prefill_max);
+                    applied += " prefill=" + num(o.prefill_chunk);
+                    if ((int64_t) v > tune_prefill_max)
+                        applied += "(capped at the startup chunk; a bigger one needs a restart)";
+                } else if (known && k == "short_read") {
+                    o.short_read = (int64_t) v;
+                    applied += " short_read=" + num(o.short_read);
+                } else if (known && k == "prompt_cache") {
+                    o.prompt_cache = (int) v;
+                    applied += " prompt_cache=" + num(o.prompt_cache);
+                } else if (known && k == "prompt_cache_every") {
+                    o.prompt_cache_every = (int64_t) v;
+                    applied += " prompt_cache_every=" + num(o.prompt_cache_every);
+                } else if (known && k == "adapt_every") {
+                    o.adapt_every = (int) v;
+                    applied += " adapt_every=" + num(o.adapt_every);
+                } else if (known && k == "suffix_draft") {
+                    o.suffix_draft = (int) std::min<int64_t>((int64_t) v, tune_suffix_max);
+                    applied += " suffix_draft=" + num(o.suffix_draft);
+                    if ((int64_t) v > tune_suffix_max) applied += "(capped at the startup depth)";
+                } else if (known && k == "mtp_max_t") {
+                    o.mtp_max_t = (int) std::min<int64_t>((int64_t) v, (int64_t) S);
+                    const int sm = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;
+                    mtp.set_max_drafts(sm - 1);
+                    applied += " mtp_max_t=" + num(sm);
+                } else if (known && k == "pcie_frac") {
+                    o.pcie_frac = std::clamp(v, 0.0, 1.0);
+                    applied += " pcie_frac=" + std::to_string(o.pcie_frac);
+                } else if (known && k == "spec_min_p") {
+                    o.spec_min_p = std::clamp(v, 0.0, 1.0);
+                    applied += " spec_min_p=" + std::to_string(o.spec_min_p);
+                } else {
+                    refused += " " + kv + "(unknown or not retunable)";
+                }
+            }
+            std::string out = applied.empty() ? std::string("TUNED none") : ("TUNED" + applied);
+            if (!refused.empty()) out += " refused:" + refused;
+            std::printf("%s\n", out.c_str());
+            std::fflush(stdout);
+        };
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -5060,6 +5137,8 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            // the runtime retune: handled here, before the request's busy scope, because it is not a request
+            if (line.rfind("TUNE", 0) == 0 && (line.size() == 4 || line[4] == ' ')) { handle_tune(line); continue; }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }

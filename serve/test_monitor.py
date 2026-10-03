@@ -123,6 +123,7 @@ class Monitor(unittest.TestCase):
 
     def test_history_is_authorized_and_does_not_capture_headers(self):
         self.svc.api_key = "secret"
+        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         auth = {"Authorization": "Bearer secret"}
         self.assertEqual(self.request("/api/requests")[0], 401)
         self.assertEqual(self.request("/api/requests?id=missing")[0], 401)

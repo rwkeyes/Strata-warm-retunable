@@ -305,7 +305,8 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
 download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
-app. It has three tabs:
+app. (A start that should not open a browser - a kiosk, a headless or remote box - takes `--no-open` on the server's
+arguments, or `STRATA_NO_BROWSER=1`; the address is still printed.) It has three tabs:
 - **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
   images are on, and sampling and thinking-level settings. Chats stay in your browser.
 - **Monitor:** what the model is doing (reading the prompt, with progress, or writing, at how many tokens/s); GPU load,
@@ -534,28 +535,42 @@ print(r.choices[0].message.content)
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   in an admin PowerShell, and make sure the network is set to Private.
+- **Who has to present that key (`api_key_scope`, `api_key_allow`).** A key protects the server; the scope says which
+  callers are already trusted by address and may skip it: `"api_key_scope": "lan"` (the default) exempts **this PC and
+  the local network** (the private ranges `10/8`, `172.16/12`, `192.168/16`, link-local, and IPv6's `fc00::/7` and
+  `fe80::/10`), so a key for the tunnel does not mean typing it on every device at home; `"localhost"` exempts this PC
+  only; `"all"` exempts nobody (what 0.1.38 did: the key is required from every caller); `"off"` asks nobody for a key
+  (the check is off, for a server you protect some other way). `"api_key_allow": ["10.1.2.0/24", "192.168.4.7"]`
+  exempts named addresses and netblocks on top of the scope. Loopback is exempt in `lan` and `localhost` only; carrier
+  NAT (`100.64/10`) is deliberately not "your network". Both settings answer **400** if a value cannot be read. They are
+  also **retunable while the server runs** (see POST /props below), and a request naming one of these addresses in
+  `Host` or `Origin` still has to pass those checks - see the two bullets below.
 - **From the internet.** Put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
   `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
   clients then send it as their API key. Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass
   each token on at once. The web app's settings and MCP tools only answer Strata's own page: when you open it through
   a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
-  With the key set, any `Host` name reaches the server (see Host names below).
+  With a key set, a request that SENDS the key skips the `Host` check (see Host names below) - a tunnel that passes
+  its own name on should send it, or have its name in `allowed_hosts`.
 - **From web apps in a browser (CORS).** Off by default. `"cors_origins": ["https://chat.example.com"]` lets pages of
   those origins call `/v1/*` from the browser (Open WebUI's direct connections, browser extensions); `["*"]` lets any
   page do it - only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools.
 - **Host names (DNS rebinding).** A web page of another site can point its own name at `127.0.0.1` and then reach
-  this server as if it were its own, so without an API key the server answers only requests whose `Host` is a name
-  it knows (with a key the check is off: such a page cannot send the key, and tunnels and proxies that pass their
-  own name on keep working):
+  this server as if it were its own, so the server answers only requests whose `Host` is a name it knows - and it
+  checks this whenever the request does not carry the API key (with a key, a request that sends it skips the check:
+  such a page cannot send the key, and tunnels and proxies that pass their own name on keep working. A request that
+  does NOT send the key keeps the check even when its address is exempt from the key, because a rebinding page arrives
+  from `127.0.0.1` too - that is what `api_key_scope` exempts):
   `localhost` (and `*.localhost`), any IP address (`127.0.0.1`, `[::1]`, `192.168.x.x`, ...), the address it
   listens on and, when it listens beyond this PC (`0.0.0.0` or a LAN address), this PC's name (`mypc`, `mypc.local`)
   and `host.docker.internal`; any port. Others get **403** naming the setting, and the server window prints one line
   for each. Reach it under another name (a reverse proxy that keeps the name, a tunnel, a DNS name on your network,
   another container's name for it)? Add the name: `"allowed_hosts": ["strata.example.com"]` in
   `strata-<model>.json` or `STRATA_ALLOWED_HOSTS=strata.example.com` (comma-separated); `".example.com"` allows that
-  name and every name below it, and `["*"]` turns the check off (so does setting `api_key`). The hosts of
-  `trusted_origins` count as allowed. Requests without a `Host` header (HTTP/1.0 clients) pass.
+  name and every name below it, and `["*"]` turns the check off (as does carrying the API key). The hosts of
+  `trusted_origins` count as allowed. Requests without a `Host` header (HTTP/1.0 clients) pass. A request that carries
+  the API key skips the check (upstream's rule, kept: a tunnel or proxy passing its own name on should send the key).
 - **Web pages without an API key.** Without `api_key`, a `POST` to `/v1/*` that carries an `Origin` header (a
   browser page sent it) is answered only for Strata's own page, pages on `localhost` or an allowed host name (any
   port), the origins in `trusted_origins` or `cors_origins`, and browser extensions and desktop apps
@@ -564,6 +579,20 @@ print(r.choices[0].message.content)
   other servers) are not affected. With
   an API key, the key decides. `POST /unload` and `POST /load` take `Content-Type: application/json` from Strata's
   own page (or no `Origin`), like `/settings`.
+- **Changing settings without a restart (`POST /props`).** `GET /props` reports the live settings; `POST /props`
+  changes them, JSON from Strata's own page, and answers `{"success": true, ...}` with what is now in effect:
+  `{"api_key_scope": "off"}`, `{"api_key_allow": ["10.0.0.0/8"]}`, `{"api_key": "new-key"}` (`""` sets none) — **these
+  need the key when one is set**, even from an exempt address, so a trusted network cannot switch its own exemption
+  off for everyone — and `{"strata_tune": {"prefill": 4096, "adapt_every": 100000}}`, engine settings that every
+  later request carries (a request's own `strata_tune` in its body wins; `null` drops one). Unknown settings and
+  unreadable values answer **400** and change nothing. The retunable engine keys and what each costs are in
+  `warm-retune/RETUNE-CANDIDATES.md`; a key the engine cannot change in place is refused by the engine, which says
+  so in its own log line.
+- **No browser tab on start (`--no-open`).** Setup's launchers pass `--open`, which opens the web app in a browser as
+  the model becomes ready — on a headless, kiosk or remote box that window lands somewhere unwanted. Add `--no-open`
+  to the server's arguments (`serve/server.py --no-open ...`) or set `STRATA_NO_BROWSER=1`, which beats `--open`
+  whatever order they are in and needs no edit of a launcher setup wrote. The start still prints the address, so
+  nothing is hidden.
 
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new

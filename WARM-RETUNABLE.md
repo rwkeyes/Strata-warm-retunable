@@ -1,14 +1,20 @@
-# Strata 0.1.37 — warm-retunable + AVX1 floor
+# Strata v0.1.38 — warm-retunable + API-key scope + AVX1 floor
 
-A fork of [Strata](https://github.com/Niko1221/Strata) **v0.1.37** carrying two things upstream does not:
+A fork of [Strata](https://github.com/Niko1221/Strata) **v0.1.38** carrying what upstream does not:
 
 1. a vendored-llama.cpp **runtime retune** patch — change a running llama-server's slot count, per-slot
-   context and KV pool **without reloading the weights** (this section), and
-2. an **AVX1 floor** build — SSE4.2 + AVX, `STRATA_ISA_FLOOR=ON` — so the engine also runs on an AVX-only
+   context and KV pool **without reloading the weights**,
+2. the same idea for **Strata's own engine**: a `TUNE` line on its serve protocol and a `POST /props` that
+   stores defaults, so the knobs that are read per request can be changed under a running server,
+3. an **API-key scope** — the key can be required from everyone (upstream's behaviour), from everything but
+   this PC, or from everything but this PC and the local network (the default), plus an ALLOW list of
+   addresses/netblocks, all retunable while it runs,
+4. **`--no-open` / `$STRATA_NO_BROWSER`** — a start that must not pop a browser tab (kiosk, headless, remote),
+5. an **AVX1 floor** build — SSE4.2 + AVX, `STRATA_ISA_FLOOR=ON` — so the engine also runs on an AVX-only
    CPU (a Sandy Bridge Xeon), which upstream's AVX2 baseline refuses with an illegal instruction
    (see the AVX1 floor section below).
 
-Upstream's vendored llama.cpp (`3cf0325`, the revision v0.1.37 still pins) answers `POST /props` with a stub —
+Upstream's vendored llama.cpp (`3cf0325`, the revision v0.1.38 still pins) answers `POST /props` with a stub —
 `{"success": true}` and nothing else. With this patch it actually re-shapes a running server:
 
 | request | effect |
@@ -81,12 +87,90 @@ integer ops).
 (`tools/test_setup_amd.py` 1, `tools/test_setup_golden.py` 46) with identical counts on upstream v0.1.37
 without the fork work.
 
+## The engine's own retune (`TUNE` + `POST /props`)
+
+The same idea inside Strata: the engine is a resident process fed one request per line on stdin
+(`GEN <max_new> key=value … <ids>`), and those keys already carried per-request tuning (`pcie_frac`,
+`spec_min_p`, the sampling keys — the code calls them "tuning keys … without restarting the engine", which
+is where the setup's calibration measures from). This fork adds:
+
+* **`TUNE key=value …`** — a line the engine applies to its live option struct and answers
+  `TUNED <applied> refused:<...>`; it is handled between requests, before the request's busy scope.
+* **`POST /props`** (server, JSON from Strata's own page) with `{"strata_tune": {...}}`, stored as the default
+  every later request carries; a request's own `strata_tune` wins, `null` drops a key. `GET /props` reports
+  the current values. The server sends a `TUNE` line only when the values differ from what the engine has.
+* Both ends validate: `TUNE_KEYS` in `serve/server.py` answers **400** for an unknown key or an out-of-range
+  value (a typo must not look applied), and the engine refuses what it does not know.
+
+| key | what it changes |
+|---|---|
+| `prefill` | the prompt-path chunk, and so how much of the expert cache a prompt borrows. Down any time; **up only to the startup chunk**, because the prompt buffers were sized from it at load |
+| `short_read` | how many fresh tokens are read through the decode windows instead of the batched prompt path |
+| `prompt_cache`, `prompt_cache_every` | conversation checkpoints kept between requests, and how often one is taken |
+| `adapt_every` | the adaptive expert-swap cadence, in decode rounds (also the reproducibility knob: `100000` = static) |
+| `suffix_draft` | prompt-lookup draft depth, `0` = MTP only (**capped at the startup depth**) |
+| `mtp_max_t` | the MTP's window cap — re-issued through `mtp.set_max_drafts()`, a plain field write |
+| `pcie_frac`, `spec_min_p` | the PCIe share of a missed expert, the draft-probability floor |
+
+Nothing is reloaded, no VRAM moves and no session state is dropped: these are read out of the engine's option
+struct when they are *used*, so writing the field is the whole change. Deliberately not in this class:
+`--spec` (the verify geometry is built from it), `--max-context`/`--kv` (session state), the expert tiers
+(allocated), and every `--native-*`/graph flag (baked into captured graphs — see `session.h`'s "a graph bakes
+in its arguments"). `warm-retune/RETUNE-CANDIDATES.md` is the full audit, including that rebuild class and
+what an end user might still want from it.
+
+## The API key's scope
+
+Upstream 0.1.38 sets `api_key` and then requires it from **every** caller. This fork keeps that as an option
+and adds the scope a home LAN wants:
+
+| `api_key_scope` | who skips the key |
+|---|---|
+| `lan` (**the default**) | this PC **and the local network**: `10/8`, `172.16/12`, `192.168/16`, link-local, IPv6's `fc00::/7` and `fe80::/10` |
+| `localhost` | this PC only |
+| `all` | nobody — upstream's behaviour, restorable with one setting |
+| `off` | nobody is asked for a key at all (the feature is off) |
+
+`"api_key_allow": ["10.1.2.0/24", "192.168.4.7"]` (also `--api-key-allow`, `$STRATA_API_KEY_ALLOW`) exempts
+named addresses and netblocks on top of the scope; `lan` and `localhost` honour it, `all` does not. Carrier
+NAT (`100.64/10`) is deliberately *not* "your network". An unreadable peer address needs the key (fail
+closed). Set either with the config key, the CLI flag (`--api-key-scope`), or the environment
+(`$STRATA_API_KEY_SCOPE`), and **change both while it runs**:
+
+```sh
+curl -s localhost:8080/props | jq '{api_key, api_key_scope, api_key_allow}'
+curl -s -X POST localhost:8080/props -d '{"api_key_scope": "localhost", "api_key_allow": ["10.1.0.0/16"]}'
+curl -s -X POST localhost:8080/props -d '{"api_key_scope": "off"}'      # the check off, for the whole server
+curl -s -X POST localhost:8080/props -d '{"api_key": ""}'               # no key at all
+```
+
+**Two behaviours changed, on purpose, and they are the interesting part:**
+
+* **Changing the policy needs the key when one is set** — `POST /props` ignores the scope for this, so an
+  exempt LAN client cannot switch its own exemption off for everybody.
+* **The DNS-rebinding `Host` check now follows the key, not the setting of one.** Upstream turned the check
+  off for everyone as soon as `api_key` was set. If it stayed that way, scope `lan` would exempt `127.0.0.1`
+  from the key *and* switch off the check that exists for pages arriving from `127.0.0.1` — the hole the check
+  is for. So: a request that **carries** the key skips the check (upstream's behaviour for tunnels and
+  proxies, kept), and a request that does not carry it keeps the check, exempt address or not. A tunnel that
+  passes its own name on should therefore send the key, or have its name in `allowed_hosts`.
+  `serve/test_security.py` has both cases as tests.
+
+## No browser tab on start
+
+Setup writes `--open` into every launcher, so a start pops the web app in a browser — on a kiosk, a headless
+box or a remote session that window goes somewhere it should not. `--no-open` on the server's arguments (or
+`STRATA_NO_BROWSER=1`, which beats `--open` whatever the order and needs no edit of a launcher setup wrote)
+suppresses it; the address is still printed. Invocation-time only, deliberately not retunable.
+
 ## What this fork changes
 
-1. `warm-retune/retune-llama-server-3cf0325.patch` and `warm-retune/apply.sh` — the patch itself, plus an
+1. `warm-retune/retune-llama-server-3cf0325.patch` and `warm-retune/apply.sh` — the llama.cpp patch, plus an
    idempotent `apply` / `undo` / `check` script (undo reverse-applies the patch; nothing else is needed
    because the vendored tree is regenerated by setup).
-2. `setup.py` — three changes, all inert on a checkout with no vendored tree yet:
+2. `warm-retune/RETUNE-CANDIDATES.md` — the audit behind the engine retune: what is in-place, what needs a
+   rebuild, what can never move.
+3. `setup.py` — three changes, all inert on a checkout with no vendored tree yet:
    * `get_llama_cpp()` calls `apply_warm_retune()` once the tree is present (freshly extracted or
      already on disk), so a setup run leaves the tree warm-retunable; a failure warns instead of
      aborting the setup.
@@ -94,26 +178,34 @@ without the fork work.
      Windows' 260-character path limit (#206), but `tools/CMakeLists.txt` adds it unconditionally when
      `LLAMA_BUILD_SERVER` is on — without it, no llama-server can even be configured from this tree.
    * `isa_floor_defs()` adds `-DSTRATA_ISA_FLOOR=ON` to a local HIP/CUDA build when `STRATA_ISA_FLOOR=1`.
-3. the AVX1 floor itself: the `STRATA_ISA_FLOOR` block in `CMakeLists.txt`, the relaxed startup gate plus
+4. `src/program/generate.cpp` — the `TUNE` line and its handler (class 1 keys, with the two ceilings).
+5. `serve/server.py` — `TUNE_KEYS` + `clean_tune`/`tune_str`, `POST /props`, the API-key scope and allow
+   list (`key_needed_for`, `set_api_key_policy`), the `Host`/`Origin`-check rule above, `--no-open` /
+   `browser_suppressed` / `open_browser`; `serve/test_security.py`, `serve/test_server.py` and the other
+   suites carry the tests.
+6. the AVX1 floor itself: the `STRATA_ISA_FLOOR` block in `CMakeLists.txt`, the relaxed startup gate plus
    the scalar router fallback (`src/program/generate.cpp`, `src/core/expert_source.cpp`), the `constexpr`
    sign table and the AVX1 expert-row path (`src/kernels/cpu/`). Measured on a Xeon E5-2687W and on
    gfx1100 — see the section above.
-4. `src/kernels/cpu/kq_avx1.cpp` (+ `kq_avx1.hpp`), built with `-mavx -msse4.2`: the AVX1 router dot, 264x
+7. `src/kernels/cpu/kq_avx1.cpp` (+ `kq_avx1.hpp`), built with `-mavx -msse4.2`: the AVX1 router dot, 264x
    to 489x faster than the scalar fallback on the CPU this floor is for (see the table above). It is
    dispatched from `expert_source.cpp` only when the CPU has AVX1 but not AVX2, so AVX2/AVX-512 hosts keep
    the existing `-mavx2` kernel, and the scalar path that remains (no AVX at all) no longer uses
    `std::fma`.
 
-1. `warm-retune/retune-llama-server-3cf0325.patch` and `warm-retune/apply.sh` — the patch itself, plus an
-   idempotent `apply` / `undo` / `check` script (undo reverse-applies the patch; nothing else is needed
-   because the vendored tree is regenerated by setup).
-2. `setup.py` — two changes, both inert on a checkout with no vendored tree yet:
-   * `get_llama_cpp()` calls `apply_warm_retune()` once the tree is present (freshly extracted or
-     already on disk), so a setup run leaves the tree warm-retunable; a failure warns instead of
-     aborting the setup.
-   * the extraction no longer drops `tools/ui` **on non-Windows platforms**. Upstream excludes it for
-     Windows' 260-character path limit (#206), but `tools/CMakeLists.txt` adds it unconditionally when
-     `LLAMA_BUILD_SERVER` is on — without it, no llama-server can even be configured from this tree.
+## Verification status (be exact about this)
+
+* `serve/test_security.py` (43 tests) — the scope matrix, the allow list, `POST /props` incl. the
+  key-required-for-policy rule, the rebinding/cross-site regression with an exempt caller, the `TUNE` line's
+  format and the server's "only when it changed" logic — all against the mock engine, no GPU.
+* `serve/test_server.py` (121), `test_lifecycle` (8), `test_mcp` (25), `test_monitor` (7),
+  `test_structured` (8) — green. The 3 errors in `serve/test_detok.py` are pre-existing on v0.1.38 (identical
+  on the untouched tree).
+* `src/program/generate.cpp` — **compiles** (`g++ -fsyntax-only -std=c++20 -D__HIP_PLATFORM_AMD__
+  -Iinclude -Iinclude/strata/hip_compat -I/opt/rocm/include …`, 0 errors). Not linked, and **not yet run**: a
+  live `TUNE` round trip needs the HIP engine built and a pack loaded (the 7900 XTX was serving another model
+  while this was written, and the box was at 16/16 GB swap). Until that is done, treat the engine-side keys
+  as compile-verified only.
 
 ## Use it
 

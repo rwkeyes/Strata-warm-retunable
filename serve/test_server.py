@@ -248,6 +248,9 @@ class StatusNeedsTheKey(unittest.TestCase):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         svc.api_key = "k3y"
+        # api_key_scope "lan" (the default) exempts this PC: this test is about what "all" (upstream's
+        # behaviour, no exemption) does, so it asks for it explicitly
+        svc.api_key_scope = "all"
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}/status"
         try:
@@ -1250,6 +1253,7 @@ class SharedSettings(unittest.TestCase):
 
     def test_they_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
+        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         try:
             self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}})[0], 401)
             self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}},
@@ -1374,6 +1378,7 @@ class WebApp(unittest.TestCase):
 
     def test_discovery_needs_the_api_key(self):
         self.svc.api_key = "secret"
+        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         try:
             for path in ("/models", "/v1/models", "/props", "/slots"):
                 self.assertEqual(self.get(path)[0], 401)
@@ -1417,6 +1422,7 @@ class WebApp(unittest.TestCase):
 
     def test_metrics_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
+        self.svc.api_key_scope = "all"      # the default ("lan") exempts this PC (see serve/test_security.py)
         try:
             self.assertEqual(self.get("/metrics")[0], 401)
             self.assertEqual(self.get("/metrics", {"Authorization": "Bearer secret"})[0], 200)
@@ -2327,6 +2333,44 @@ class LostStep(unittest.TestCase):
 
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class NoBrowser(unittest.TestCase):
+    """--no-open and $STRATA_NO_BROWSER: a start never pops a browser tab (upstream's setup writes --open into
+    every launcher, which puts a window on whichever desktop runs it - a kiosk or a headless box has none)."""
+
+    def test_the_environment_values(self):
+        from serve.server import browser_suppressed
+        for env in ({"STRATA_NO_BROWSER": "1"}, {"STRATA_NO_BROWSER": "true"}, {"STRATA_NO_BROWSER": " YES "},
+                    {"STRATA_NO_BROWSER": "on"}, {"STRATA_NO_BROWSER": "2"}):
+            self.assertTrue(browser_suppressed(env), env)
+        for env in ({}, {"STRATA_NO_BROWSER": ""}, {"STRATA_NO_BROWSER": "0"}, {"STRATA_NO_BROWSER": "false"},
+                    {"STRATA_NO_BROWSER": "no"}, {"STRATA_NO_BROWSER": "off"}, {"OTHER": "1"}):
+            self.assertFalse(browser_suppressed(env), env)
+
+    def test_open_browser_opens_only_when_asked_and_nothing_suppresses_it(self):
+        from serve.server import open_browser
+        with mock.patch("webbrowser.open") as wb:
+            self.assertTrue(open_browser("127.0.0.1", 8095, True))
+            wb.assert_called_once_with("http://127.0.0.1:8095/")
+            wb.reset_mock()
+            self.assertFalse(open_browser("127.0.0.1", 8095, False))                          # no --open, no tab
+            self.assertFalse(open_browser("127.0.0.1", 8095, True, {"STRATA_NO_BROWSER": "1"}))  # the env wins
+            self.assertFalse(open_browser("127.0.0.1", 8095, False, {"STRATA_NO_BROWSER": "0"}))
+            wb.assert_not_called()
+        out = io.StringIO()                                        # a suppressed popup still says where the page is
+        with contextlib.redirect_stdout(out):
+            open_browser("192.168.1.5", 8095, True, {"STRATA_NO_BROWSER": "1"})
+        self.assertIn("http://192.168.1.5:8095/", out.getvalue())
+        self.assertIn("STRATA_NO_BROWSER", out.getvalue())
+
+    def test_the_flag_exists_and_is_documented(self):
+        import subprocess
+        p = subprocess.run([sys.executable, str(ROOT / "serve/server.py"), "--help"],
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("--no-open", p.stdout)
+        self.assertIn("STRATA_NO_BROWSER", p.stdout)
 
 
 if __name__ == "__main__":
