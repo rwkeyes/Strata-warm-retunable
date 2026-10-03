@@ -37,7 +37,7 @@ Decode is **2.8× faster** on the NVMe (median), and the *first* request after a
 disk hurts most: 15.5 → 58.9 t/s (3.8×).  Prefill settles near **990 t/s** on the NVMe from the first big prompt,
 while the HDD needs three trials to reach the same range (664 → 944 → 965) — its prefill rate is bounded by how
 fast the expert blobs come off the disk.  Expert-cache hit rates were 98.7–99.5% on both arms, so this is the
-storage tier's cost, not a cache-shape difference; the engine's own accounting shows the HDD arm reading 54 GB from
+storage tier's cost, not a difference in how the cache was populated; the engine's own accounting shows the HDD arm reading 54 GB from
 the GGUF during the run.
 
 ## What this does not say

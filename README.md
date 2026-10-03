@@ -1,7 +1,7 @@
 <h1 align="center">Strata_Dirigo</h1>
 
 <p align="center"><b>Dirigo Agents' fork of <a href="https://github.com/Niko1221/Strata">Strata</a></b><br>
-runtime-retunable · LAN-aware auth · minefield-hardened serving path · runs on older hardware too</p>
+runtime-retunable · LAN-aware keys · hardened request handling · runs on older hardware too</p>
 
 > ### ⚠️ The old fork is deprecated — use Strata_Dirigo
 > This repository replaces **`Strata-warm-retunable`** and its **`warm-retunable`** branch. That name and branch
@@ -22,7 +22,7 @@ keeps it that way. Details, evidence and caveats for each item are in
 | # | Feature | What it gives you | How to use it |
 |---|---|---|---|
 | 1 | **Strata's own engine re-tunes without a restart** | Change nine engine settings under a live server — no reload, no VRAM movement, no dropped session | `POST /props {"strata_tune": {...}}`, or a per-request `strata_tune` |
-| 2 | **The vendored llama.cpp re-tunes too** (`llama-server`) | Re-slice slots, per-slot context and the KV pool, or rebuild the context — **the weights stay resident** | `POST /props` on a `llama-server` built from this tree (`warm-retune/apply.sh`) |
+| 2 | **The vendored llama.cpp re-tunes too** (`llama-server`) | Change how many slots share the context, how much each may use, and the pool behind them — **the weights stay loaded** | `POST /props` on a `llama-server` built from this tree (`warm-retune/apply.sh`) |
 | 3 | **API-key scope + ALLOW list** | Decide who may skip the API key: nobody (upstream default), the local network, this PC only, or the check off — plus named addresses/netblocks | `--api-key-scope` / `--api-key-allow`, the config, or `POST /props` |
 | 4 | **No browser tab on start** | A headless/kiosk/remote start stays quiet | `--no-open`, or `STRATA_NO_BROWSER=1` (beats `--open`) |
 | 5 | **AVX1 floor** | The engine runs on an **AVX-only** CPU (Sandy Bridge-era Xeons) instead of dying with an illegal instruction | `STRATA_ISA_FLOOR=1 ./setup.sh` |
@@ -56,26 +56,26 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 With `--kv-unified` every slot shares **one** KV budget, and each slot's context is a *reservation* against it:
 `-np 4 -c 131072` is four 32,768-token shares — so three idle slots are holding 96k tokens of KV that a single
 long-context request could be using. The usual fix is to restart the server with different flags, which means
-reading the whole model back in (a minute or more) and dropping every open conversation. This patch makes the
-shape a knob instead:
+reading the whole model back in (a minute or more) and dropping every open conversation. This patch lets you
+change them instead:
 
 ```sh
 llama-server -m model.gguf -ngl 99 -fa on --kv-unified --props -np 4 -c 131072 -a my-model
-curl -s localhost:8080/props | jq '{total_slots, slots_max, kv_pool_n_ctx, kv_unified}'  # the shape now
+curl -s localhost:8080/props | jq '{total_slots, slots_max, kv_pool_n_ctx, kv_unified}'  # what it is set to now
 
 curl -s -X POST localhost:8080/props -d '{"parallel": 4, "ctx_per_slot": 32768}'   # four short sessions
 curl -s -X POST localhost:8080/props -d '{"parallel": 1, "ctx_per_slot": 131072}'  # one long-context request
 curl -s -X POST localhost:8080/props -d '{"ctx": 262144}'                          # grow the pool itself
-curl -s -X POST localhost:8080/props -d '{"cache_type_k": "q8_0"}'                 # or the KV's own shape
+curl -s -X POST localhost:8080/props -d '{"cache_type_k": "q8_0"}'                 # or how the KV itself is stored
 ```
 
-**Why you would want to:** the demand oscillates — a coding agent fanning out four subagents wants four slots, and
-the 100k-token repository you paste a minute later wants one big one — and neither shape is "the right config".
-Moving between them costs **0–0.4 ms** for a re-slice and **~0.8 s** to rebuild the pool (a 32k → 262k pool,
+**Why you would want to:** what you need keeps changing — a coding agent fanning out four subagents wants four slots, and
+the 100k-token repository you paste a minute later wants one big one — and neither setup is right all the time.
+Moving between them costs **0–0.4 ms** to divide the pool differently and **~0.8 s** to make it bigger (32k → 262k,
 measured), because the weight buffers are never touched; a restart costs a full model reload. A request that would
 pull a **busy** slot out from under a live conversation is refused with
 `HTTP 400 slot N is busy, cannot take it out of service` — never a hang, never a silent drop. Measured costs, the
-VRAM-per-pool table, and the `parallel_max` / oversubscribe paths:
+VRAM-per-pool table, and the `parallel_max` and over-subscription paths:
 [`warm-retune/SLOTS-AND-KV-POOL.md`](warm-retune/SLOTS-AND-KV-POOL.md).
 
 ### Hardware reach

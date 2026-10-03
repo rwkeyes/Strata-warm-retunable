@@ -1,7 +1,7 @@
 # The minefield doctor on this fork's lane — findings, fixes, retest
 
 [`Blackwellboy/model-serving-minefield`](https://github.com/Blackwellboy/model-serving-minefield) is a registry of
-serving-path traps: request-shaped defects that are **not** the weights. Run against Strata's OpenAI surface it
+traps in how requests are served: defects that are **not** the weights. Run against Strata's OpenAI surface it
 audits the layer between the client and the model — template rendering, the request field set, tool gating,
 thinking/routing and the budget arithmetic — which is exactly the layer this fork changes.
 
@@ -37,7 +37,7 @@ weight change, a re-quant, or a different checkpoint**.
 
 All server-side or template-side; the engine and the weights are untouched.
 
-| trap | fix | where | knob |
+| trap | fix | where | setting |
 |---|---|---|---|
 | 78 | `tool_choice` implemented: `"none"` **omits the tools payload** from what the engine is offered (a lane never offered a tool cannot call one, whatever the template does), a named function narrows the offer to that one, `"required"` is offered and **reported unenforced**, and any value that cannot be honoured is a **400**. Anthropic's `{"type": "none"│"any"│"tool"}` too. | `serve/frontend.py` (`tool_choice_of`, `offer_tools`), `serve/server.py` (both API paths), and MCP tools are not even collected under `"none"` | per request |
 | 77 | Unknown fields are named **once each** in the log (the API and the field), and **every response carries a `strata` block** with the effective settings, so a client asserts on the response per request rather than on the status code. `"strict_params": true` turns an unknown field into a **400** listing it. | `serve/frontend.py` (`unknown_params`, the field sets), `serve/server.py` (`check_params`, `effective_settings`, `openai_collect`) | `strict_params` (config or `POST /props`) |
@@ -83,8 +83,8 @@ away.
 `serve/test_minefield.py` — one class per trap, named after it, so a regression reads as the trap reopening:
 `tool_choice` (11 tests incl. that `"none"` keeps the tool out of the prompt the engine was handed, that a bad
 value is a 400, and that a name the request does not offer is refused), the request surface (unit + strict/lenient
-over HTTP + the retunable knobs), the effective-settings echo (non-stream, stream's first chunk, Anthropic), the
-cap-hit, and the template (the pack's rendering with the knob on, this server's without it, real reasoning still
+over HTTP + the settings you can change while it runs), the effective-settings echo (non-stream, stream's first chunk, Anthropic), the
+cap-hit, and the template (the pack's rendering with that setting on, this server's without it, real reasoning still
 preserved, and all 10 goldens matching this tree).
 
     python -m unittest serve.test_minefield -v      # 39 tests
@@ -126,7 +126,7 @@ thinking, so it has no answer"`).
 `strata-minefield.py`: **5/5 scored**, every probe `finish=stop`, answers `Paris` / `9.9` / `ok` / `3` / `olleh`.  The
 upstream `dequant_fidelity.py` reported `capital ok, decimal BLOCKING (out=''), nonempty ok` on the same lane — its
 generation mode sends no `chat_template_kwargs` and a small budget, so on a thinking-by-default lane it reads the
-empty `content` of a reply that was still thinking (the very shape trap 12 describes).  The two are not in
+empty `content` of a reply that was still thinking — exactly what trap 12 describes.  The two are not in
 conflict: the fork's battery asks for thinking off and strips the CoT, which is the difference between measuring
 the model and measuring the budget.  No dequant corruption is indicated by either.
 

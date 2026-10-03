@@ -13,7 +13,7 @@ Branch: **`warm-retune-sec`** (the published default branch is `warm-retunable`)
 
 | # | Feature | Where it lives | Retunable at runtime | Verified |
 |---|---|---|---|---|
-| 1 | llama-server re-shapes itself: slots, per-slot context, KV pool, cache types — weights resident | `warm-retune/retune-llama-server-3cf0325.patch` (vendored llama.cpp `tools/server`) | yes — `POST /props` | upstream patch: measured (0–0.4 ms re-slice, ~0.8 s context rebuild) |
+| 1 | llama-server changes its own sizes: slots, per-slot context, KV pool, cache types — weights stay loaded | `warm-retune/retune-llama-server-3cf0325.patch` (vendored llama.cpp `tools/server`) | yes — `POST /props` | upstream patch: measured (0–0.4 ms to change the shares, ~0.8 s to enlarge the context) |
 | 2 | **Strata's own engine** re-tunes without a restart | `src/program/generate.cpp` (`TUNE`), `serve/server.py` (`POST /props`) | yes — the whole point | tests + live HTTP; engine side compile-verified, not yet run on a GPU |
 | 3 | API-key **scope** + **ALLOW list** (upstream's behaviour by default, exemption opt-in at invocation) | `serve/server.py` | yes — `POST /props` and the CLI flags | 47 security tests + live smoke |
 | 4 | A start that does **not** pop a browser tab | `serve/server.py` (`--no-open`, `$STRATA_NO_BROWSER`) | no — invocation-time by design | tests + `--help` |
@@ -28,13 +28,13 @@ Branch: **`warm-retune-sec`** (the published default branch is `warm-retunable`)
 ## 1 — The vendored llama.cpp runtime retune (llama-server)
 
 Upstream's vendored llama.cpp (`3cf0325`) answers `POST /props` with a stub, `{"success": true}` and nothing
-else.  `warm-retune/retune-llama-server-3cf0325.patch` (1107 lines, 6 files) makes it re-shape a **running**
+else.  `warm-retune/retune-llama-server-3cf0325.patch` (1107 lines, 6 files) changes the same sizes on a **running**
 server without reloading the weights:
 
 | request | effect |
 |---|---|
-| `{"parallel": N, "ctx_per_slot": T}` | re-slice the unified KV pool across N slots — **in place**, 0–0.4 ms |
-| `{"ctx": N}`, `{"cache_type_k": "q8_0"}`, `{"flash_attn": "on"}`, `{"parallel_max": N}`, `{"kv_unified": true}` | rebuild the `llama_context` in place (~0.8 s for 32k→262k), weights never reloaded |
+| `{"parallel": N, "ctx_per_slot": T}` | divide the unified KV pool across N slots, with no restart — 0–0.4 ms |
+| `{"ctx": N}`, `{"cache_type_k": "q8_0"}`, `{"flash_attn": "on"}`, `{"parallel_max": N}`, `{"kv_unified": true}` | rebuild the context without restarting (~0.8 s for 32k→262k); the weights never reload |
 | `{"allow_oversubscribe": true}` | let slots share a pool that cannot back them all |
 
 A request that would evict a busy slot is refused with `HTTP 400 slot N is busy, cannot take it out of
@@ -50,7 +50,7 @@ Worked example with the reasons, the measured costs and the VRAM-per-pool table:
 
 ## 2 — Strata's own engine re-tunes without a restart
 
-The same idea, inside Strata.  The engine is a resident process fed one request per line on stdin
+The same idea, inside Strata.  The engine is a long-running process fed one request per line on stdin
 (`GEN <max_new> key=value … <ids>`); those keys already carried per-request tuning (`pcie_frac`, `spec_min_p`),
 which is what setup's calibration measured from.  The fork adds the missing half:
 
@@ -199,13 +199,13 @@ by `tools/strata_tokenizer.py` — so editing the repo's template alone never re
 * `~/bin/strata-fix-pack-template.sh [--undo|--check]` applies it to packs built before the fix, one backup per
   template under `~/.backup/files/pack-template/`, with the restore command printed.
 
-Both new knobs are retunable while the server runs, like the API-key policy.
+Both new settings can be changed while the server runs, like the API-key policy.
 
 ## 11 — The retune audit (documentation, not code)
 
 `warm-retune/RETUNE-CANDIDATES.md` is the source-level audit behind feature 2: which parameters are read when
-they are *used* (retunable in place — the nine keys above, plus the ones still unwired: `--turn-token`, the PLE
-I/O knobs, the server-side `idle_unload_s`/`min_free_vram_mib`/reasoning budget), which are consumed once
+they are *used* (changeable while it runs — the nine keys above, plus the ones still unwired: `--turn-token`, the PLE
+I/O settings, the server-side `idle_unload_s`/`min_free_vram_mib`/reasoning budget), which are consumed once
 (session state, expert arena, CPU pool — the rebuild class), and which are baked into captured CUDA graphs and
 can never move.  It exists so the next person does not re-derive it, and so an end user with a use case we did
 not imagine can see what is cheap to add.

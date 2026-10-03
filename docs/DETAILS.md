@@ -590,7 +590,7 @@ print(r.choices[0].message.content)
   later request carries (a request's own `strata_tune` in its body wins; `null` drops one). Unknown settings and
   unreadable values answer **400** and change nothing. The retunable engine keys and what each costs are in
   `warm-retune/RETUNE-CANDIDATES.md`; a key the engine cannot change in place is refused by the engine, which says
-  so in its own log line. The same call also sets the two response-shape knobs below (`{"strict_params": true}`,
+  so in its own log line. The same call also sets the two response settings below (`{"strict_params": true}`,
   `{"preserve_empty_think": true}`), so they need no restart either.
 - **Gating tool calls per request (`tool_choice`).** `"none"` means no tool may be called on that turn: the tools
   payload is **not sent to the engine at all** (and MCP tools are not collected), because a lane that is never
