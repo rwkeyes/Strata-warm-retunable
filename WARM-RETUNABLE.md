@@ -58,6 +58,25 @@ a tighter controlled test measured decode **21.8 → 19.1 tok/s (~12%) with byte
 cannot run at all. Both raw arms and the caveats are in `bench/results/2026-10-01-avx1-floor/`; the curated
 entry is `docs/benchmarks/2026-10-01-gfx1100-avx1-floor.json`.
 
+**The router dot — the reason the floor is usable at all.** The lookahead that warms the file tier runs one
+router dot per layer, and the floor's first version did it scalar with `std::fma` — which on a CPU with no
+FMA instruction is a **libm call per element**, not an instruction. Measured on the Xeon E5-2665 this fork
+exists for, one layer's router `[512 experts x 5120 embd]`:
+
+| | ms/layer | per 48-layer lookahead pass | vs scalar `std::fma` |
+|---|---|---|---|
+| scalar `std::fma` (the first version) | 214.3 | 10.3 s | 1x |
+| scalar mul+add | 3.33 | 160 ms | 64x |
+| **`bf16_rows_dot_multi_avx1`** (this fork) | **0.81** | **39 ms** | **264x** |
+
+For a 4- or 6-token window it is 1.91 ms / 2.63 ms per layer (450x / 489x, 92 ms / 126 ms per pass), and
+the kernel agrees with the scalar reference to `max |diff| = 1.1e-4` on values ~56 (the mul+add vs FMA
+rounding). Ten seconds to forty milliseconds per pass is the difference between a floor build that serves
+and one that does not. The remaining AVX1 cost is the expert rows themselves: `native_gu_rows` falls
+through to ggml-cpu's **single-token** `vec_dot`, so a 4-6 token verify window re-reads each weight row
+4-6 times — a multi-token AVX1 kernel is the next win, and a real port (AVX1 has neither FMA nor 256-bit
+integer ops).
+
 **Pre-existing, not this fork:** the project's own GPU-free setup tests have two failures on this tree
 (`tools/test_setup_amd.py` 1, `tools/test_setup_golden.py` 46) with identical counts on upstream v0.1.37
 without the fork work.
@@ -79,6 +98,11 @@ without the fork work.
    the scalar router fallback (`src/program/generate.cpp`, `src/core/expert_source.cpp`), the `constexpr`
    sign table and the AVX1 expert-row path (`src/kernels/cpu/`). Measured on a Xeon E5-2687W and on
    gfx1100 — see the section above.
+4. `src/kernels/cpu/kq_avx1.cpp` (+ `kq_avx1.hpp`), built with `-mavx -msse4.2`: the AVX1 router dot, 264x
+   to 489x faster than the scalar fallback on the CPU this floor is for (see the table above). It is
+   dispatched from `expert_source.cpp` only when the CPU has AVX1 but not AVX2, so AVX2/AVX-512 hosts keep
+   the existing `-mavx2` kernel, and the scalar path that remains (no AVX at all) no longer uses
+   `std::fma`.
 
 1. `warm-retune/retune-llama-server-3cf0325.patch` and `warm-retune/apply.sh` — the patch itself, plus an
    idempotent `apply` / `undo` / `check` script (undo reverse-applies the patch; nothing else is needed
