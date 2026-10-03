@@ -195,7 +195,7 @@ suppresses it; the address is still printed. Invocation-time only, deliberately 
 
 ## Verification status (be exact about this)
 
-* `serve/test_security.py` (43 tests) — the scope matrix, the allow list, `POST /props` incl. the
+* `serve/test_security.py` (44 tests) — the scope matrix, the allow list, `POST /props` incl. the
   key-required-for-policy rule, the rebinding/cross-site regression with an exempt caller, the `TUNE` line's
   format and the server's "only when it changed" logic — all against the mock engine, no GPU.
 * `serve/test_server.py` (121), `test_lifecycle` (8), `test_mcp` (25), `test_monitor` (7),
