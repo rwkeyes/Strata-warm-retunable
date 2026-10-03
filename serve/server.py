@@ -2090,10 +2090,7 @@ def make_handler(svc: Service):
 
         def parse_request(self):
             """The Host check (DNS rebinding) applies whenever the request is not authenticated - see
-            _host_check_applies(): with a key presented, upstream's rule stands (tunnels and proxies that pass
-            their own name on keep working), while a keyless server, scope "off" and the addresses api_key_scope
-            exempts all keep the check, because for them it is the only thing between a rebinding page and the
-            model."""
+            _host_check_applies(), which is deliberately not the negation of the key check."""
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
@@ -2217,23 +2214,28 @@ def make_handler(svc: Service):
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             return hmac.compare_digest(given.encode(), svc.api_key.encode())   # #213: constant-time
 
+        def _key_ok(self) -> bool:
+            """Does this request pass the API-key check (without answering)?  What the API endpoints ask: no key is
+            set, or the scope/allow list exempts this address, or the key is present and right."""
+            return (not svc.api_key or not svc.key_needed_for(self.client_address[0])
+                    or self._key_matches())
+
         def _host_check_applies(self) -> bool:
-            """The Host (DNS rebinding) check runs for a caller that is NOT authenticated: one that presented the
-            key keeps upstream's behaviour (a tunnel or proxy passing its own name on), and one that must present
-            the key but did not is refused by _authorized anyway.  Everyone else - an address api_key_scope
-            exempts, a keyless server, scope "off" - is who the check is for: a rebinding page arrives from
-            127.0.0.1, which scope "lan"/"localhost" exempts from the key, so the check CANNOT be skipped for
-            exempt callers without opening the hole it exists to close."""
+            """The Host (DNS rebinding) and Origin checks run for a request that is NOT authenticated.  A request
+            that carries the key skips them (upstream's rule: a tunnel or proxy passing its own name on keeps
+            working), and so does one that must carry a key but did not - `_authorized` refuses it anyway.
+
+            **This is deliberately NOT the negation of `_key_ok()`**, and the difference is the whole security
+            story: the API check passes on a KEYLESS server (there is nothing to present), while the rebinding and
+            cross-site checks must run exactly there - the keyless server is the one they exist for.  Only an
+            address `api_key_scope` exempts turns `_key_ok()` true without the key, and a rebinding page arrives
+            from that address (127.0.0.1), so it must keep the checks."""
             return not (svc.key_needed_for(self.client_address[0]) or self._key_matches())
 
         def _authorized(self, force_key: bool = False) -> bool:
-            # Who must present the key: the scope's exemptions (this PC, the local network, api_key_allow) decide
-            # it per request - `force_key` ignores them, for what only the key's owner may do (POST /props).
-            if not force_key and not svc.key_needed_for(self.client_address[0]):
-                return True
-            if self._key_matches():
-                return True
-            if not svc.api_key:                            # force_key with no key set: nothing to check
+            # `force_key` (POST /props) ignores the scope's exemptions: the key itself, or no key at all
+            ok = (self._key_matches() or not svc.api_key) if force_key else self._key_ok()
+            if ok:
                 return True
             where = (" (the key itself is the owner's: POST /props ignores api_key_scope)" if force_key else
                      "" if svc.api_key_scope == "off" else
@@ -2898,8 +2900,10 @@ def parse_netblocks(entries) -> tuple:
             continue
         x = str(raw).strip()
         try:
-            out.append(ipaddress.ip_network(x, strict=False) if "/" in x else ipaddress.ip_network(x + "/32")
-                       if ":" not in x else ipaddress.ip_network(x))
+            # a bare address is a host route (/32, or /128 in IPv6); an explicit netblock must BE a netblock -
+            # "192.168.4.7/24" is a typo, not a request for the whole /24, so it is refused rather than widened
+            out.append(ipaddress.ip_network(x) if "/" in x
+                       else ipaddress.ip_network(x + ("/128" if ":" in x else "/32")))
         except ValueError:
             raise ValueError(f"api_key_allow: {x!r} is not an IP address or a netblock like 10.0.0.0/8 or "
                              f"192.168.4.7") from None

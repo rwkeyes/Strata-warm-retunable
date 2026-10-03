@@ -5071,6 +5071,7 @@ int main(int argc, char** argv) {
         auto handle_tune = [&](const std::string& l) {
             std::string applied, refused;
             std::istringstream in(l.size() > 4 ? l.substr(5) : std::string());
+            const auto num = [](int64_t x) { return std::to_string((long long) x); };
             std::string kv;
             while (in >> kv) {
                 const size_t eq = kv.find('=');
@@ -5081,7 +5082,6 @@ int main(int argc, char** argv) {
                 // a value must be a number and must be there: "prefill=abc" is a typo, not a request for 0
                 const bool known = eq != std::string::npos && end != nullptr && end != kv.c_str() + eq + 1 &&
                                    *end == '\0' && v >= 0.0;
-                const auto num = [&](int64_t x) { return std::to_string((long long) x); };
                 if (known && k == "prefill") {
                     o.prefill_chunk = std::min<int64_t>((int64_t) v, tune_prefill_max);
                     applied += " prefill=" + num(o.prefill_chunk);
@@ -5115,7 +5115,7 @@ int main(int argc, char** argv) {
                     o.spec_min_p = std::clamp(v, 0.0, 1.0);
                     applied += " spec_min_p=" + std::to_string(o.spec_min_p);
                 } else {
-                    refused += " " + kv + "(unknown or not retunable)";
+                    refused += " " + kv + "(unknown key, or a value it cannot take)";
                 }
             }
             std::string out = applied.empty() ? std::string("TUNED none") : ("TUNED" + applied);

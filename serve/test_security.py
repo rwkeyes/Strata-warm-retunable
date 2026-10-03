@@ -209,6 +209,19 @@ class OverHttp(HttpHarness, unittest.TestCase):
         self.assertEqual(self.req("GET", "/status", host=tunnel)[0], 200)    # this PC is exempt in scope "lan"
         self.assertEqual(self.req("GET", "/status", host="other.example.com")[0], 403)
 
+    def test_the_host_check_is_not_the_negation_of_the_key_check(self):
+        """Pins the distinction a "DRY" pass broke once: replacing the Host/Origin predicate with `not _key_ok()`
+        turns the rebinding check OFF on a KEYLESS server, which is exactly the server it exists for (the API check
+        passes there because there is no key to present).  Three cases, in order: keyless, exempt-with-a-key, and
+        authenticated-with-a-key."""
+        self.start()                                                                    # no key configured at all
+        self.assertEqual(self.req("GET", "/status", host="evil.example.com")[0], 403)
+        self.tearDown()                                                                  # close that server first
+        self.start(api_key="s3cret", api_key_scope="lan")                                # this PC is exempt
+        self.assertEqual(self.req("GET", "/status", host="evil.example.com")[0], 403)
+        self.assertEqual(self.req("GET", "/status", host="evil.example.com",
+                                  headers={"Authorization": "Bearer s3cret"})[0], 200)   # upstream's tunnel rule
+
     def test_a_trusted_origin_s_host_is_allowed(self):
         self.start(trusted_origins=["https://strata.example.com"])
         self.assertEqual(self.req("GET", "/status", host="strata.example.com")[0], 200)
@@ -340,7 +353,8 @@ class ApiKeyScope(unittest.TestCase):
         self.assertEqual(api_key_allow_of("192.168.4.7 , 172.16.0.0/12"),          # --api-key-allow / the env
                          ["192.168.4.7/32", "172.16.0.0/12"])
         self.assertEqual(api_key_allow_of(["10.0.0.0/8"]), ["10.0.0.0/8"])          # the config's list form
-        for bad in (["evil.com"], ["10.0.0.0/33"], ["192.168.1.5:8080"], ["10.0.0.0/8", None], 5, [3]):
+        for bad in (["evil.com"], ["10.0.0.0/33"], ["192.168.1.5:8080"], ["10.0.0.0/8", None], 5, [3],
+                    ["192.168.4.7/24"]):        # a host inside a netblock is a typo, not a /24
             with self.assertRaises(ValueError, msg=bad):
                 api_key_allow_of(bad)
 
