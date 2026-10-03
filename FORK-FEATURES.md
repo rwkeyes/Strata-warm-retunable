@@ -242,6 +242,7 @@ tools/strata_tokenizer.py                            feature 10 — applies it a
 serve/test_security.py                               47 tests: scope, allow list, POST /props, the checks' rules
 serve/test_minefield.py                              45 tests: one class per trap (78, 77, 12, 04/25), named after it
 warm-retune/MINEFIELD-FINDINGS.md                    the doctor's findings, the fixes, and the retest
+warm-retune/NVME-VS-HDD.md                           the storage A/B (cold start + the bench table)
 WARM-RETUNABLE.md                                    per-feature measurements and caveats
 ```
 
